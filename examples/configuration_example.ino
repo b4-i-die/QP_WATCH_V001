@@ -178,55 +178,70 @@ const char* menuItems[] = {
 /*
  * Example 1: Low Power Configuration
  * For maximum battery life
+ * 
+ * Note: To use these settings, modify the #define values in your main code
+ * or declare them as variables instead of constants
  */
 void configureLowPower() {
+  // Runtime modifiable settings
   autoSleep = true;
-  SLEEP_TIMEOUT = 10000; // 10 seconds
   brightness = 64; // Low brightness
   stepTracking = false; // Disable step tracking
-  DISPLAY_UPDATE_INTERVAL = 1000; // Update less frequently
+  
+  // These require changing #define values in main code:
+  // #define SLEEP_TIMEOUT 10000 // 10 seconds
+  // #define DISPLAY_UPDATE_INTERVAL 1000 // Update less frequently
 }
 
 /*
  * Example 2: Fitness Focus Configuration
  * For active users who want comprehensive tracking
+ * 
+ * Note: Hardware-related settings require changing #define values in main code
  */
 void configureFitness() {
+  // Runtime modifiable settings
   autoSleep = false;
   brightness = 255; // Maximum brightness for outdoor use
   stepTracking = true;
-  STEP_GOAL = 15000; // Higher daily goal
-  USE_MPU6050 = true; // Enable accurate step counting
-  USE_MAX30102 = true; // Enable heart rate monitoring
+  
+  // These require changing #define values in main code:
+  // #define STEP_GOAL 15000 // Higher daily goal
+  // #define USE_MPU6050 true // Enable accurate step counting
+  // #define USE_MAX30102 true // Enable heart rate monitoring
 }
 
 /*
  * Example 3: Minimal/Clean Configuration
  * For users who prefer simplicity
+ * 
+ * Note: Some settings require modifying the main code
  */
 void configureMinimal() {
+  // Runtime modifiable settings
   watchfaceStyle = STYLE_MINIMAL;
-  SHOW_SECONDS = false;
   autoSleep = true;
   stepTracking = false;
   
-  // Reduced menu options
-  const char* menuItems[] = {
-    "Watchface",
-    "Battery",
-    "Sleep"
-  };
+  // These require changing values in main code:
+  // #define SHOW_SECONDS false
+  // Reduced menu items array in main code
 }
 
 /*
  * Example 4: Developer/Debug Configuration
  * For development and testing
+ * 
+ * Note: Debug settings require modifying #define values in main code
  */
 void configureDeveloper() {
-  DEBUG_MODE = true;
-  SERIAL_BAUD = 115200;
+  // Runtime modifiable settings
   autoSleep = false; // Stay awake for testing
-  DISPLAY_UPDATE_INTERVAL = 100; // Fast updates
+  
+  // These require changing #define values in main code:
+  // #define DEBUG_MODE true
+  // #define SERIAL_BAUD 115200
+  // #define DISPLAY_UPDATE_INTERVAL 100 // Fast updates
 }
 
 // ============================================
