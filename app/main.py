@@ -17,7 +17,14 @@ def check_fundamentals(symbol: str):
     """
     try:
         yf_symbol = symbol.replace("BIST:", "") + ".IS"
-        stock = yf.Ticker(yf_symbol)
+        
+        # Yahoo Finance 429 Too Many Requests hatasını aşmak için User-Agent ekliyoruz
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+        
+        stock = yf.Ticker(yf_symbol, session=session)
         info = stock.info
         
         # Temel verileri çek (Bulunamazsa 999 ata ki filtreye takılsın)
