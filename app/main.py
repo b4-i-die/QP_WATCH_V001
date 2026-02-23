@@ -1,8 +1,12 @@
 from fastapi import FastAPI, Request
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 import uvicorn
 import os
+
+# SSL uyarılarını gizle
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI()
 
@@ -26,7 +30,8 @@ def check_fundamentals(symbol: str):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         
-        response = requests.get(url, headers=headers, timeout=10)
+        # SSL sertifika doğrulamasını atlamak için verify=False ekliyoruz
+        response = requests.get(url, headers=headers, timeout=10, verify=False)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.text, 'html.parser')
