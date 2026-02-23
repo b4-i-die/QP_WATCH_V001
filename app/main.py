@@ -68,7 +68,9 @@ def check_fundamentals(symbol: str):
 def send_telegram_message(text: str):
     """Telegram'a mesaj gönderir."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    # Markdown parse hatasını önlemek için parse_mode'u kaldırıyoruz veya HTML kullanıyoruz.
+    # Şimdilik en güvenlisi parse_mode kullanmamak.
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
     try:
         response = requests.post(url, json=payload)
         response.raise_for_status()
