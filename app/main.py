@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request
-import yfinance as yf
 import requests
+from bs4 import BeautifulSoup
 import uvicorn
 import os
 
@@ -12,34 +12,45 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID_GELECEK")
 
 def check_fundamentals(symbol: str):
     """
-    Yahoo Finance üzerinden hissenin temel verilerini çeker.
-    BIST hisseleri yfinance'ta .IS uzantısı ile bulunur (Örn: THYAO.IS)
+    İş Yatırım üzerinden hissenin temel verilerini (PD/DD ve F/K) çeker.
+    Yahoo Finance botları engellediği için alternatif olarak kullanıyoruz.
     """
     try:
-        yf_symbol = symbol.replace("BIST:", "") + ".IS"
+        # BIST:THYAO formatından sadece THYAO kısmını al
+        clean_symbol = symbol.replace("BIST:", "").strip()
         
-        # Yahoo Finance 429 Too Many Requests hatasını aşmak için User-Agent ekliyoruz
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Cache-Control": "max-age=0"
-        })
+        # İş Yatırım hisse detay sayfası
+        url = f"https://www.isyatirim.com.tr/tr-tr/analiz/hisse/Sayfalar/sirket-karti.aspx?hisse={clean_symbol}"
         
-        stock = yf.Ticker(yf_symbol, session=session)
-        info = stock.info
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
         
-        # Temel verileri çek (Bulunamazsa 999 ata ki filtreye takılsın)
-        pb_ratio = info.get('priceToBook', 999) # PD/DD
-        pe_ratio = info.get('trailingPE', 999)  # F/K
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'lxml')
+        
+        # İş Yatırım sayfasındaki PD/DD ve F/K değerlerini bulma
+        # Tablodaki değerleri bulmak için spesifik etiketleri arıyoruz
+        pb_ratio = 999.0
+        pe_ratio = 999.0
+        
+        # PD/DD (Piyasa Değeri / Defter Değeri)
+        pd_dd_row = soup.find('td', string='PD/DD')
+        if pd_dd_row and pd_dd_row.find_next_sibling('td'):
+            val_str = pd_dd_row.find_next_sibling('td').text.strip().replace(',', '.')
+            if val_str and val_str != '-':
+                pb_ratio = float(val_str)
+                
+        # F/K (Fiyat / Kazanç)
+        fk_row = soup.find('td', string='F/K')
+        if fk_row and fk_row.find_next_sibling('td'):
+            val_str = fk_row.find_next_sibling('td').text.strip().replace(',', '.')
+            if val_str and val_str != '-':
+                pe_ratio = float(val_str)
+        
+        print(f"İş Yatırım'dan çekilen veriler - {clean_symbol}: PD/DD={pb_ratio}, F/K={pe_ratio}")
         
         # Kriterler: PD/DD < 2.0 VE F/K < 10.0
         is_attractive = (pb_ratio < 2.0) and (pe_ratio < 10.0)
