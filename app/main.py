@@ -29,7 +29,7 @@ def check_fundamentals(symbol: str):
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         
-        soup = BeautifulSoup(response.text, 'lxml')
+        soup = BeautifulSoup(response.text, 'html.parser')
         
         # İş Yatırım sayfasındaki PD/DD ve F/K değerlerini bulma
         # Tablodaki değerleri bulmak için spesifik etiketleri arıyoruz
