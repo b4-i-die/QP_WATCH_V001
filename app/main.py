@@ -69,7 +69,14 @@ def send_telegram_message(text: str):
     """Telegram'a mesaj gönderir."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    requests.post(url, json=payload)
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        print(f"Telegram mesajı başarıyla gönderildi: {response.status_code}")
+    except Exception as e:
+        print(f"Telegram mesajı gönderilirken hata oluştu: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Telegram API Yanıtı: {e.response.text}")
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
