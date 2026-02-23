@@ -42,14 +42,14 @@ def check_fundamentals(symbol: str):
         pe_ratio = 999.0
         
         # PD/DD (Piyasa Değeri / Defter Değeri)
-        pd_dd_row = soup.find('td', string='PD/DD')
+        pd_dd_row = soup.find('th', string='PD/DD')
         if pd_dd_row and pd_dd_row.find_next_sibling('td'):
             val_str = pd_dd_row.find_next_sibling('td').text.strip().replace(',', '.')
             if val_str and val_str != '-':
                 pb_ratio = float(val_str)
                 
         # F/K (Fiyat / Kazanç)
-        fk_row = soup.find('td', string='F/K')
+        fk_row = soup.find('th', string='F/K')
         if fk_row and fk_row.find_next_sibling('td'):
             val_str = fk_row.find_next_sibling('td').text.strip().replace(',', '.')
             if val_str and val_str != '-':
