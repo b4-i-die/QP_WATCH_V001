@@ -79,6 +79,18 @@ async def receive_webhook(request: Request):
     signal = data.get("signal")
     price = data.get("price")
     
+    # TEST MODU: Eğer sinyal "TEST_SIGNAL" ise temel analizi atla ve direkt mesaj at
+    if signal == "TEST_SIGNAL":
+        print(f"TEST Sinyali Alındı: {symbol}")
+        msg = f"🧪 **TEST MESAJI** 🧪\n\n"
+        msg += f"📌 **Hisse:** {symbol}\n"
+        msg += f"⚙️ **Sinyal:** {signal}\n"
+        msg += f"💰 **Fiyat:** {price} TL\n\n"
+        msg += f"✅ *Bu bir test mesajıdır. Telegram entegrasyonu çalışıyor.*"
+        
+        send_telegram_message(msg)
+        return {"status": "success", "message": "Test message sent to Telegram"}
+    
     print(f"Sinyal Alındı: {symbol} - {signal} - {price} TL")
     
     # 1. Temel Analiz Kontrolü
