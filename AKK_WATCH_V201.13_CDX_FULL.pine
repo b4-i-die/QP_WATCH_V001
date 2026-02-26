@@ -1,0 +1,2215 @@
+//@version=5
+// =============================================================================
+// AKK_WATCH_V201.13_CDX_FULL
+// FIX #1  : Stop ratchet (stop asla aşağı gevşemez)
+// FIX #2  : Short-Ralli simetrik trail eklendi
+// FIX #3  : PUSU R:R initialStop ile hesaplanıyor
+// FIX #4  : Exit etiketinde realFill notu
+// FIX #5  : calc_on_every_tick=false + dataHigh/dataLow tutarlılık
+// FIX #6  : initialStop tracking → R_initial / R_current ayrımı
+// FIX #7  : TP1 hit etiketi eklendi
+// FIX #8  : smartStop mesafe sınırı (1.5×riskUnit)
+// FIX #9  : Aynı barda stop+target → açılış bazlı heuristik
+// FIX #10 : PUSU exit loglama (TP2/STOP/TIMEOUT ayrımı)
+// =============================================================================
+
+strategy("AKK_WATCH_V201.13_CDX_FULL", overlay=true, calc_on_every_tick=false, process_orders_on_close=false, initial_capital=10000, default_qty_type=strategy.cash, default_qty_value=10000, currency=currency.USD, max_labels_count=500, max_lines_count=500)
+// =============================================================================
+// BÖLÜM 0: ADAPTİF ZEKA (ZAMAN x PİYASA)
+// =============================================================================
+
+// --- 1. ZAMAN PROFİLİ (Timeframe Profile) ---
+int tfSeconds = timeframe.in_seconds(timeframe.period)
+
+var string tfName        = "GENEL"
+var float  tf_BaseRisk   = 1.5
+var float  tf_ReducedRisk= 0.5
+var int    tf_AdxThresh  = 25
+var float  tf_TargetR    = 4.0
+var int    tf_BreakLen   = 14
+var float  tf_Mesafe     = 6.0
+var float  tf_VolThresh  = 2.0
+
+if tfSeconds <= 3600
+    tfName         := "🛡️ SNIPER (1H)"
+    tf_BaseRisk    := 1.0
+    tf_ReducedRisk := 0.25
+    tf_AdxThresh   := 30
+    tf_TargetR     := 3.0
+    tf_BreakLen    := 20
+    tf_Mesafe      := 4.0
+    tf_VolThresh   := 1.8
+else if tfSeconds <= 14400
+    tfName         := "⚖️ BALANCED (4H)"
+    tf_BaseRisk    := 1.5
+    tf_ReducedRisk := 0.5
+    tf_AdxThresh   := 25
+    tf_TargetR     := 3.5
+    tf_BreakLen    := 14
+    tf_Mesafe      := 6.0
+    tf_VolThresh   := 2.0
+else
+    tfName         := "👑 TREND KING (8H+)"
+    tf_BaseRisk    := 2.0
+    tf_ReducedRisk := 1.0
+    tf_AdxThresh   := 20
+    tf_TargetR     := 5.0
+    tf_BreakLen    := 10
+    tf_Mesafe      := 8.0
+    tf_VolThresh   := 2.5
+
+// --- MARKET PROFİL OVERRIDE (INPUTS) ---
+group_market = "MARKET PROFİL OVERRIDE"
+useMarketOverride = input.bool(false, "Market Profil Override Aktif mi?", group=group_market)
+useSilverProfile  = input.bool(true,  "XAG (Silver) Özel Profil Aktif", group=group_market)
+
+inp_market_TargetMult  = input.float(1.0, "Market Target Mult", group=group_market, step=0.1)
+inp_market_RiskMult    = input.float(1.0, "Market Risk Mult", group=group_market, step=0.1)
+inp_market_AdxAdd      = input.int(0, "Market ADX Add", group=group_market, minval=-20, maxval=20)
+inp_market_StopAtrMult = input.float(1.0, "Market StopATR Mult", group=group_market, step=0.1)
+
+// --- 2. PİYASA PROFİLİ (Market Profile) ---
+bool isCrypto = (syminfo.type == "crypto") or str.contains(syminfo.ticker, "USDT")
+bool isForex  = (syminfo.type == "forex")
+bool isIndex  = (syminfo.type == "index") or (syminfo.type == "cfd" and (str.contains(syminfo.ticker, "NAS") or str.contains(syminfo.ticker, "SPX") or str.contains(syminfo.ticker, "GER") or str.contains(syminfo.ticker, "US30")))
+bool isStock  = (syminfo.type == "stock")
+bool isSilver = str.contains(str.upper(syminfo.ticker), "XAG") or str.contains(str.upper(syminfo.ticker), "SILVER")
+
+float market_TargetMult  = 1.0
+float market_RiskMult    = 1.0
+int   market_AdxAdd      = 0
+float market_StopAtrMult = 1.0
+string marketName        = "EMTIA/GENEL"
+
+if isCrypto
+    marketName        := "KRİPTO 🎢"
+    market_TargetMult := 1.5
+    market_RiskMult   := 0.8
+    market_AdxAdd     := 5
+else if isForex
+    marketName        := "FOREX 💱"
+    market_TargetMult := 0.8
+    market_AdxAdd     := -5
+else if isIndex or isStock
+    marketName        := "ENDEKS/HİSSE 📈"
+    market_StopAtrMult:= 1.5
+else if isSilver and useSilverProfile
+    marketName        := "GÜMÜŞ ⚙️"
+    market_TargetMult := 1.1
+    market_RiskMult   := 0.9
+    market_AdxAdd     := 5
+    market_StopAtrMult:= 1.2
+
+// --- SEMBOL + TF OVERRIDE (AUTO) ---
+string symbolKey = str.upper(syminfo.ticker)
+string tfKey = tfSeconds <= 1800 ? "30" : tfSeconds <= 3600 ? "60" : tfSeconds <= 14400 ? "240" : "D+"
+
+bool hasSymbolTfOverride = false
+float sym_TargetMult = na
+float sym_RiskMult = na
+int   sym_AdxAdd = na
+float sym_StopAtrMult = na
+
+if symbolKey == "XAUUSD"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+
+else if symbolKey == "XAUTRYG"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+
+else if symbolKey == "ALTIN"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+
+else if symbolKey == "XAGUSD"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+
+else if symbolKey == "XAGTRYG"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+
+else if symbolKey == "GMSTR"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.0
+
+else if symbolKey == "BTCUSDT"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+
+else if symbolKey == "BTCUSD"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+
+else if symbolKey == "XRPUSDT"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+
+else if symbolKey == "XAUTUSDT"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+
+else if symbolKey == "PAXGTRY"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.5
+        sym_RiskMult := 0.8
+        sym_AdxAdd := 5
+        sym_StopAtrMult := 1.0
+
+else if symbolKey == "XU030"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.5
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.5
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.5
+
+else if symbolKey == "XU100"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.5
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.5
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.5
+
+else if symbolKey == "QQQM"
+    if tfKey == "30"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.5
+    else if tfKey == "60"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.5
+    else if tfKey == "240"
+        hasSymbolTfOverride := true
+        sym_TargetMult := 1.0
+        sym_RiskMult := 1.0
+        sym_AdxAdd := 0
+        sym_StopAtrMult := 1.5
+
+if hasSymbolTfOverride
+    // FIX: Nötr override'ları atla (1.0/1.0/0/1.0 → Market Profil aktif kalır)
+    bool isNeutralOverride = (sym_TargetMult == 1.0 and sym_RiskMult == 1.0 and sym_AdxAdd == 0 and sym_StopAtrMult == 1.0)
+    if not isNeutralOverride
+        market_TargetMult  := sym_TargetMult
+        market_RiskMult    := sym_RiskMult
+        market_AdxAdd      := sym_AdxAdd
+        market_StopAtrMult := sym_StopAtrMult
+        marketName         := "SYMBOL OVERRIDE"
+
+// --- KULLANICI GİRDİLERİ ---
+
+bool alarmTestModu = input.bool(false, "🚨 Alarm Test Modu", group="ALARM AYARLARI")
+
+group_adaptif = "🧬 ADAPTİF SİSTEM"
+bool useAutoAdapt = input.bool(true, "Adaptif Zekayı Kullan", group=group_adaptif)
+
+group_gorsel = "GÖRSEL AYARLAR"
+showTable    = input.bool(true,  "Bilgi Panelini Göster", group=group_gorsel)
+showMatrix   = input.bool(true,  "Matrix Detaylarını Göster", group=group_gorsel)
+mobilMode    = input.bool(false, "Mobil Mod", group=group_gorsel)
+showLabels   = input.bool(true,  "Sinyal Etiketleri", group=group_gorsel)
+showLivePanel= input.bool(true,  "ATR Canlı Paneli", group=group_gorsel)
+debugMode    = input.bool(false, "🔍 Debug Modu", group=group_gorsel)
+
+group_mm = "💰 HEDGE FUND RİSK YÖNETİMİ"
+// [FIX] accountBalance kaldırıldı — strategy.equity risk hesabında zaten kullanılıyor
+maxDailyLossPercent  = input.float(5.0, "Günlük Max Loss %", group=group_mm)
+maxLeverageCap       = input.float(5.0, "Max Kaldıraç Tavanı (Safety Cap)", group=group_mm)
+slippageBufferPercent= input.float(0.15, "Slippage Buffer %", group=group_mm)
+commissionPercent    = input.float(0.05,  "Commission %", group=group_mm)
+
+group_short = "🔻 SHORT AYARLARI"
+enableShorts        = input.bool(false, "Shortları Aç", group=group_short)
+enableLongs         = input.bool(true, "Longları Aç", group=group_short)
+shortRiskPercent    = input.float(0.3, "Short Risk % (Long'dan düşük)", group=group_short, minval=0.1, step=0.1)
+shortAdxAdd         = input.int(10, "Short için ekstra ADX (+)", group=group_short, minval=0, maxval=20)
+shortRsiMin         = input.int(65, "Short RSI Min", group=group_short, minval=50, maxval=80)
+
+bool showLongUI  = enableLongs
+bool showShortUI = enableShorts
+bool showSafetyOnce = showLongUI and showShortUI
+
+// --- OPTİMİZASYON INPUTLARI ---
+group_opt = "⚙️ OPTİMİZASYON"
+opt_gapLimit       = input.float(4.0, "Gap Limiti (%)", group=group_opt, step=0.1)
+opt_flashCrashPct  = input.float(5.0, "Flash Crash %", group=group_opt, step=0.1)
+opt_flashCrashBars = input.int(10, "Flash Crash Bar", group=group_opt, minval=1)
+opt_wickVeto       = input.float(0.75, "Wick Veto Oranı", group=group_opt, step=0.05)
+opt_scoreReqBase   = input.float(60.0, "Skor Eşiği (Base)", group=group_opt, step=1)
+opt_highVolMult    = input.float(0.90, "High-Vol Filtre Çarpanı", group=group_opt, step=0.05)
+
+// --- MARKET PROFİL OVERRIDE (UYGULAMA) ---
+if useMarketOverride
+    market_TargetMult  := inp_market_TargetMult
+    market_RiskMult    := inp_market_RiskMult
+    market_AdxAdd      := inp_market_AdxAdd
+    market_StopAtrMult := inp_market_StopAtrMult
+    marketName         := "MARKET OVERRIDE"
+
+// --- 3. NİHAİ DEĞERLER (FINAL MATRIX CALCULATION) ---
+float fixed_Risk  = 1.5
+int   fixed_Adx   = 25
+float fixed_Trgt  = 4.0
+int   fixed_BLen  = 14
+float fixed_Msf   = 6.0
+float fixed_Vol   = 2.0
+
+float RAW_RISK_BASE = useAutoAdapt ? tf_BaseRisk    : fixed_Risk
+float RAW_RISK_RED  = useAutoAdapt ? tf_ReducedRisk : (fixed_Risk / 3.0)
+int   RAW_ADX       = useAutoAdapt ? tf_AdxThresh   : fixed_Adx
+float RAW_TARGET_R  = useAutoAdapt ? tf_TargetR     : fixed_Trgt
+int   RAW_BREAK     = useAutoAdapt ? tf_BreakLen    : fixed_BLen
+float RAW_MESAFE    = useAutoAdapt ? tf_Mesafe       : fixed_Msf
+float RAW_VOL       = useAutoAdapt ? tf_VolThresh   : fixed_Vol
+
+float FINAL_RISK_BASE = RAW_RISK_BASE * market_RiskMult
+float FINAL_RISK_RED  = RAW_RISK_RED  * market_RiskMult
+int   FINAL_ADX       = RAW_ADX       + market_AdxAdd
+float FINAL_TARGET_R  = RAW_TARGET_R  * market_TargetMult
+int   FINAL_BREAK     = RAW_BREAK
+float FINAL_MESAFE    = RAW_MESAFE
+float FINAL_VOL       = RAW_VOL
+
+group_livemode = "🔴 LIVE MODE"
+enableLiveMode      = input.bool(true, "Live Mode Otomatik Tespit", group=group_livemode)
+forceBacktestRealism= input.bool(true, "Backtest'i Gerçekçi Yap", group=group_livemode)
+confirmedBarOnly    = input.bool(true, "Sadece Confirmed Bar'da Entry", group=group_livemode)
+
+group_pusu = "🛡️ MOTOR 1: PUSU"
+pusuMethod   = input.string("HYBRID", "Metot", options=["SMA", "EMA", "HYBRID"], group=group_pusu)
+pusuLookback = input.int(10, "Periyot", group=group_pusu)
+pusuTolerans = input.float(0.2, "Tolerans %", group=group_pusu)
+int pusuLookbackLTF = pusuLookback * 2  // İntraday destek/direnç periyodu
+
+group_risk = "🛡️ MOTOR 1: RİSK"
+useTrailing  = input.bool(true,  "Trailing Stop", group=group_risk)
+trailMult    = input.float(0.55, "Trail Çarpanı", group=group_risk)
+stopMultiplier = input.float(0.8, "Stop Çarpanı", group=group_risk)
+
+group_target = "🛡️ MOTOR 1: HEDEF"
+tp1Multiplier = input.float(2.5, "TP1 Çarpanı", group=group_target)
+tp2Multiplier = input.float(4.0, "TP2 Çarpanı", group=group_target)
+useAdaptiveTP = input.bool(true, "Adaptif TP2", group=group_target)
+
+group_ralli = "⚔️ MOTOR 2: RALLİ"
+useAdaptiveBreak = input.bool(true, "Adaptif Kırılım", group=group_ralli)
+riskAtrMult      = input.float(2.0, "Risk Katsayısı", group=group_ralli)
+
+group_advanced = "İLERİ SEVİYE & FİLTRELER"
+minSignalGap      = input.int(50,  "Min Sinyal Aralığı", group=group_advanced)
+useRrFilter       = input.bool(true,"R:R Filtresi", group=group_advanced)
+minRrThresh       = input.float(1.2,"Min R:R", group=group_advanced)
+useConservativeRr = input.bool(false,"Düşük Vol'de Katı R:R?", group=group_advanced)
+maxPositionBars   = input.int(100, "Max Pozisyon Barı", group=group_advanced)
+useAdxFilter      = input.bool(true,"ADX Trend Filtresi (Kalite)", group=group_advanced)
+
+fSize       = mobilMode ? size.small : size.normal
+fSizeDetail = mobilMode ? size.tiny  : size.small
+
+// =============================================================================
+// BÖLÜM 1: ÇEKİRDEK HESAPLAMALAR
+// =============================================================================
+
+bool isLiveMode = enableLiveMode ? barstate.isrealtime : false
+bool isBacktest = not isLiveMode
+
+float effectiveSlippage   = forceBacktestRealism ? slippageBufferPercent : 0.0
+float effectiveCommission = forceBacktestRealism ? commissionPercent      : 0.0
+float entrySlippage       = isBacktest ? effectiveSlippage    : slippageBufferPercent
+float entryCommission     = isBacktest ? effectiveCommission : commissionPercent
+
+var float dailyPnL = 0.0
+var int   lastDayOfWeek = dayofweek
+if dayofweek != lastDayOfWeek
+    dailyPnL := 0.0
+    lastDayOfWeek := dayofweek
+
+var array<bool>  tradeWins = array.new<bool>()
+var array<float> tradeRRs  = array.new<float>()
+
+ticker   = syminfo.tickerid
+priceFormat = close < 1000 ? "#.####" : "#.##"
+
+// FIX #5: dataClose/dataHigh/dataLow tutarlı kullanım
+float dataClose = confirmedBarOnly and not isLiveMode ? close[1] : close
+float dataLow   = confirmedBarOnly and not isLiveMode ? low[1]   : low
+float dataHigh  = confirmedBarOnly and not isLiveMode ? high[1]  : high
+
+globalATR = ta.atr(14)
+float safeATR = na(globalATR) ? close * 0.015 : globalATR
+
+rsiVal = ta.rsi(close, 14)
+[diplus, diminus, adx] = ta.dmi(14, 14)
+
+atrSma50 = ta.sma(safeATR, 50)
+volRegime = na(atrSma50) or atrSma50 == 0 ? 1.0 : safeATR / atrSma50
+
+curSec = timeframe.in_seconds(timeframe.period)
+string htfTf = ""
+if timeframe.ismonthly
+    htfTf := "12M"
+else if timeframe.isweekly
+    htfTf := "1M"
+else if timeframe.isdaily
+    htfTf := "1W"
+else if curSec >= 14400
+    htfTf := "D"
+else if curSec >= 3600
+    htfTf := "240"
+else if curSec >= 900
+    htfTf := "60"
+else
+    htfTf := "15"
+
+ema50 = ta.ema(close, 50)
+
+[htfC_raw, htfE50_raw] = request.security(ticker, htfTf, [close, ta.ema(close, 50)], lookahead=barmerge.lookahead_off)
+float htfC  = na(htfC_raw)  ? close : (confirmedBarOnly ? htfC_raw[1]  : htfC_raw)
+float htfE50= na(htfE50_raw)? ema50 : (confirmedBarOnly ? htfE50_raw[1]: htfE50_raw)
+
+string htf1Tf = curSec >= 3600 ? "240" : "60"
+[htf1C_raw, htf1E50_raw] = request.security(ticker, htf1Tf, [close, ta.ema(close, 50)], lookahead=barmerge.lookahead_off)
+float htf1C  = na(htf1C_raw)  ? close : (confirmedBarOnly ? htf1C_raw[1]  : htf1C_raw)
+float htf1E50= na(htf1E50_raw)? ema50 : (confirmedBarOnly ? htf1E50_raw[1]: htf1E50_raw)
+
+bool trendLTF   = dataClose > ema50
+bool trendHTF1 = htfC   > htfE50
+bool trendHTF2 = htf1C  > htf1E50
+bool strongTrend = trendLTF and trendHTF1 and trendHTF2
+
+bool trendLTFShort   = dataClose < ema50
+bool trendHTF1Short  = htfC   < htfE50
+bool trendHTF2Short  = htf1C  < htf1E50
+bool strongTrendShort = trendLTFShort and trendHTF1Short and trendHTF2Short
+
+bool adxOk = useAdxFilter ? (adx > FINAL_ADX) : true
+bool adxValid = adx > 20
+bool adxOkShort = useAdxFilter ? (adx > (FINAL_ADX + shortAdxAdd)) : true
+float adaptiveTP2Mult = adx > 40 ? (tp2Multiplier * 1.25) : tp2Multiplier
+
+string trendText = strongTrend ? "YUKARI" : "AŞAĞI"
+color  trendColor= strongTrend ? color.green : color.red
+
+string trendTextShort  = strongTrendShort ? "AŞAĞI" : "YUKARI"
+color  trendColorShort = strongTrendShort ? color.red : color.green
+
+// =============================================================================
+// BÖLÜM 2: GÜVENLİK FİLTRELERİ
+// =============================================================================
+
+var float avgVolLast50  = 0.0
+var float avgVolLast200 = 0.0
+
+avgVolLast50  := ta.sma(safeATR, 50)
+avgVolLast200 := ta.sma(safeATR, 200)
+
+string marketRegimeText = ""
+color  regimeColor  = color.gray
+
+if avgVolLast50 > avgVolLast200 * 1.3
+    marketRegimeText := "🔥 HIGH VOL SPIKE"
+    regimeColor  := color.red
+else if avgVolLast50 > avgVolLast200
+    marketRegimeText := "⚠️ ELEVATED VOL"
+    regimeColor  := color.orange
+else if avgVolLast50 < avgVolLast200 * 0.7
+    marketRegimeText := "😴 LOW VOL (RANGE)"
+    regimeColor  := color.blue
+else
+    marketRegimeText := "➡️ NORMAL VOL"
+    regimeColor  := color.green
+
+bool regimeOkForEntry = true
+if marketRegimeText == "🔥 HIGH VOL SPIKE"
+    regimeOkForEntry := (volRegime <= FINAL_VOL * opt_highVolMult)
+
+float gapPercent = math.abs((open - close[1]) / close[1]) * 100
+bool gapOk = gapPercent <= opt_gapLimit
+
+var float lastLow = na
+var int   flashCrashBar = 0
+bool flashCrashOk = true
+
+if na(lastLow)
+    lastLow := low
+else
+    float downMove = math.abs((low - lastLow) / lastLow) * 100
+    if downMove > opt_flashCrashPct and low < lastLow
+        flashCrashBar := bar_index
+    if bar_index - flashCrashBar <= opt_flashCrashBars
+        flashCrashOk := false
+    lastLow := math.min(lastLow, low)
+
+bool sessionOk = true
+
+bool SYSTEM_GREEN_LIGHT = regimeOkForEntry and gapOk and flashCrashOk and sessionOk
+
+// =============================================================================
+// BÖLÜM 3: PUSU MOTORU
+// =============================================================================
+
+float shortSupport = ta.lowest(low, pusuLookbackLTF)
+float shortResistance = ta.highest(high, pusuLookbackLTF)
+
+string currentPusuTf = timeframe.isweekly ? "1W" : (timeframe.ismonthly ? "1M" : "D")
+
+[dailyLowest_raw, dailySMA_raw, dailyEMA_raw] = request.security(
+     ticker,
+     currentPusuTf,
+     [ta.lowest(low, pusuLookback)[1], ta.sma(low, pusuLookback)[1], ta.ema(low, pusuLookback)[1]],
+     lookahead = barmerge.lookahead_off)
+
+[dailyHighest_raw, dailySMA_high_raw, dailyEMA_high_raw] = request.security(
+     ticker,
+     currentPusuTf,
+     [ta.highest(high, pusuLookback)[1], ta.sma(high, pusuLookback)[1], ta.ema(high, pusuLookback)[1]],
+     lookahead = barmerge.lookahead_off)
+
+float dailySupport =
+     pusuMethod == "SMA" ? (na(dailySMA_raw) ? low * 0.95 : dailySMA_raw) :
+     pusuMethod == "EMA" ? (na(dailyEMA_raw) ? low * 0.95 : dailyEMA_raw) :
+     (na(dailySMA_raw) or na(dailyLowest_raw) ? low * 0.95 : (dailySMA_raw + dailyLowest_raw) / 2)
+
+float dailyResistance =
+     pusuMethod == "SMA" ? (na(dailySMA_high_raw) ? high * 1.05 : dailySMA_high_raw) :
+     pusuMethod == "EMA" ? (na(dailyEMA_high_raw) ? high * 1.05 : dailyEMA_high_raw) :
+     (na(dailySMA_high_raw) or na(dailyHighest_raw) ? high * 1.05 : (dailySMA_high_raw + dailyHighest_raw) / 2)
+
+float pusuLevelRaw = shortSupport * 0.4 + dailySupport * 0.6
+float pusuLevel    = pusuLevelRaw * (1 + pusuTolerans / 100)
+
+float pusuLevelRawShort = shortResistance * 0.6 + dailyResistance * 0.4
+float pusuLevelShort    = pusuLevelRawShort * (1 - pusuTolerans / 100)
+
+bool supportRejection = (high[3] < pusuLevel) and (low[2] >= pusuLevel * 0.99) and (dataClose > pusuLevel * 1.01)
+bool resistanceRejection = (low[3] > pusuLevelShort) and (high[2] <= pusuLevelShort * 1.01) and (dataClose < pusuLevelShort * 0.99)
+
+int  supportTouches = 0
+for i = 0 to pusuLookbackLTF
+    if low[i] <= pusuLevel and low[i] > pusuLevel * 0.99
+        supportTouches += 1
+
+int resistanceTouches = 0
+for i = 0 to pusuLookbackLTF
+    if high[i] >= pusuLevelShort and high[i] < pusuLevelShort * 1.01
+        resistanceTouches += 1
+
+bool strongSupport = supportRejection and supportTouches >= 2
+bool strongResistance = resistanceRejection and resistanceTouches >= 2
+
+float baseMax = 10.0
+emaF_wiz = ta.ema(close, 2)
+emaM_wiz = ta.ema(close, 9)
+bool wiz_gate = emaF_wiz > emaM_wiz
+bool wiz_gate_short = emaF_wiz < emaM_wiz
+
+wickRatio   = (dataHigh - math.max(open, dataClose)) / math.max(0.0001, dataHigh - dataLow)
+volSpikeVeto= wickRatio > opt_wickVeto and volRegime > FINAL_VOL
+
+wickRatioShort   = (math.min(open, dataClose) - dataLow) / math.max(0.0001, dataHigh - dataLow)
+volSpikeVetoShort= wickRatioShort > opt_wickVeto and volRegime > FINAL_VOL
+
+float actualDistance = math.abs((dataLow - pusuLevel) / pusuLevel) * 100
+bool  mesafeVeto     = actualDistance > FINAL_MESAFE
+bool  htfVeto        = htfC < htfE50
+
+float actualDistanceShort = math.abs((dataHigh - pusuLevelShort) / pusuLevelShort) * 100
+bool  mesafeVetoShort     = actualDistanceShort > FINAL_MESAFE
+bool  htfVetoShort        = htfC > htfE50
+
+float totalScore =
+      (dataLow <= pusuLevel      ? 3.0 : 0.0) +
+      (strongTrend               ? 3.0 : 0.0) +
+      (wiz_gate                  ? 2.0 : 0.0) +
+      (rsiVal < 40               ? 1.0 : 0.0) +
+      (volRegime < FINAL_VOL     ? 1.0 : 0.0)
+
+float totalScoreShort =
+      (dataHigh >= pusuLevelShort ? 3.0 : 0.0) +
+      (strongTrendShort           ? 3.0 : 0.0) +
+      (wiz_gate_short             ? 2.0 : 0.0) +
+      (rsiVal > shortRsiMin        ? 1.0 : 0.0) +
+      (volRegime < FINAL_VOL      ? 1.0 : 0.0)
+
+float confidence = (totalScore / baseMax) * 100
+float confidenceShort = (totalScoreShort / baseMax) * 100
+
+float dynamicTp2Mult_pusu =
+      useAdaptiveTP
+          ? (volRegime > FINAL_VOL
+              ? (strongTrend ? adaptiveTP2Mult * 1.15 : adaptiveTP2Mult * 0.80)
+              : adaptiveTP2Mult)
+          : adaptiveTP2Mult
+
+float pusuStop = dailySupport + (-safeATR * stopMultiplier * market_StopAtrMult)
+float pusuStopShort = dailyResistance + (safeATR * stopMultiplier * market_StopAtrMult)
+
+float pusuTP1  = pusuLevel + (safeATR * tp1Multiplier)
+float pusuTP2  = pusuLevel + (safeATR * dynamicTp2Mult_pusu)
+float pusuTP3  = pusuLevel + (safeATR * FINAL_TARGET_R)
+float pusuTP1Short  = pusuLevelShort - (safeATR * tp1Multiplier)
+float pusuTP2Short  = pusuLevelShort - (safeATR * dynamicTp2Mult_pusu)
+float pusuTP3Short  = pusuLevelShort - (safeATR * FINAL_TARGET_R)
+
+// FIX #3: initialStop ile R:R hesabı
+var float pusuInitialStop      = na
+var float pusuInitialStopShort = na
+
+float riskMiktar_initial = math.max(dataClose * 0.0005, math.abs(dataClose - nz(pusuInitialStop, pusuStop)))
+float rr1 = (pusuTP1 - dataClose) / riskMiktar_initial
+
+float riskMiktarShort_initial = math.max(dataClose * 0.0005, math.abs(nz(pusuInitialStopShort, pusuStopShort) - dataClose))
+float rr1Short = (dataClose - pusuTP1Short) / riskMiktarShort_initial
+
+float dynamicRrThresh = minRrThresh
+if volRegime < 1.0
+    dynamicRrThresh := useConservativeRr ? minRrThresh * 1.5 : minRrThresh * 0.8
+else if volRegime > 2.0
+    dynamicRrThresh := minRrThresh * 1.2
+
+if isSilver
+    dynamicRrThresh *= 0.8
+
+bool rrOk = not useRrFilter or (rr1 >= dynamicRrThresh)
+bool rrOkShort = not useRrFilter or (rr1Short >= dynamicRrThresh)
+
+int tfMultiplier = math.max(1, int(curSec / 3600))
+int dynamicGap   = int(math.min(100, minSignalGap * tfMultiplier))
+
+if isSilver
+    dynamicGap := int(dynamicGap * 0.5)
+
+var int lastSignalBarPusu = 0
+var int lastSignalBarPusuShort = 0
+bool gapOkPusu = (bar_index - lastSignalBarPusu) > dynamicGap
+bool gapOkPusuShort = (bar_index - lastSignalBarPusuShort) > dynamicGap
+
+float scoreReq =
+      isCrypto
+          ? (volRegime > 2.0 ? opt_scoreReqBase + 10 : opt_scoreReqBase)
+          : (strongTrend ? opt_scoreReqBase - 5 : opt_scoreReqBase)
+
+float scoreReqShort =
+      isCrypto
+          ? (volRegime > 2.0 ? opt_scoreReqBase + 10 : opt_scoreReqBase)
+          : (strongTrendShort ? opt_scoreReqBase - 5 : opt_scoreReqBase)
+
+if isSilver
+    scoreReq := strongTrend ? (opt_scoreReqBase - 10) : opt_scoreReqBase
+if isSilver
+    scoreReqShort := strongTrendShort ? (opt_scoreReqBase - 10) : opt_scoreReqBase
+
+bool signalPusuRaw =
+      confidence >= scoreReq  and
+      not mesafeVeto          and
+      not htfVeto             and
+      wiz_gate                and
+      gapOkPusu               and
+      rrOk                    and
+      strongSupport           and
+      adxValid                and
+      adxOk
+
+bool signalPusuShortRaw =
+      confidenceShort >= scoreReqShort and
+      not mesafeVetoShort              and
+      not htfVetoShort                 and
+      wiz_gate_short                   and
+      gapOkPusuShort                   and
+      rrOkShort                        and
+      strongResistance                 and
+      adxValid                          and
+      adxOkShort
+
+bool signalPusu = signalPusuRaw and SYSTEM_GREEN_LIGHT
+bool signalPusuShort = enableShorts and signalPusuShortRaw and SYSTEM_GREEN_LIGHT
+
+var float activeSl   = na
+var bool  tp1Hit     = false
+var bool  inPositionPusu = false
+var float trackedT1  = na
+var float trackedT2  = na
+var int   pusuBars   = 0
+
+var float activeSlShort   = na
+var bool  tp1HitShort     = false
+var bool  inPositionPusuShort = false
+var float trackedT1Short  = na
+var float trackedT2Short  = na
+var int   pusuBarsShort   = 0
+
+// =============================================================================
+// BÖLÜM 4: RALLİ MOTORU
+// =============================================================================
+
+float rawDynLen = FINAL_BREAK * volRegime
+int   dynLen    = useAdaptiveBreak ? int(math.max(10.0, math.min(rawDynLen, 40.0))) : FINAL_BREAK
+float breakLevel= ta.highest(high, dynLen)[1]
+float breakLevelShort= ta.lowest(low, dynLen)[1]
+
+var bool  inTradeRalli     = false
+var float entryRalli       = 0.0
+var float entryRalli_net   = 0.0
+var float stopRalli        = na
+var float targetRalli      = 0.0
+var float peakRalli        = 0.0
+
+var bool  inTradeRalliShort     = false
+var float entryRalliShort       = 0.0
+var float entryRalliShort_net   = 0.0
+var float stopRalliShort        = na
+var float targetRalliShort      = 0.0
+var float troughRalliShort      = 0.0
+
+var float logGirisFiyati   = 0.0
+var int   logGirisBar      = 0
+var float logCikisFiyati   = 0.0
+var string logBitisNedeni  = ""
+var string lastTradeSide   = "LONG"
+
+var bool lastTradeWasRalli = false
+
+// FIX #6: initialStop tracking
+var float initialStopRalli      = na
+var float initialStopRalliShort = na
+
+float riskUnit = safeATR * riskAtrMult * market_StopAtrMult
+
+bool signalRalliRaw =
+      close > breakLevel          and
+      not inTradeRalli            and
+      volume > ta.sma(volume, 20) and
+      adxOk
+
+bool signalRalliShortRaw =
+      close < breakLevelShort          and
+      not inTradeRalliShort            and
+      volume > ta.sma(volume, 20) and
+      adxOkShort
+
+bool signalRalli = signalRalliRaw and SYSTEM_GREEN_LIGHT
+bool signalRalliShort = enableShorts and signalRalliShortRaw and SYSTEM_GREEN_LIGHT
+
+bool sPusu  = signalPusu
+bool sRalli = signalRalli
+bool sPusuShort = signalPusuShort
+bool sRalliShort = signalRalliShort
+
+if isSilver
+    sPusu      := false
+    signalPusu := false
+    sPusuShort := false
+    signalPusuShort := false
+
+if sRalli and sPusu
+    sPusu      := false
+    signalPusu := false
+
+if sRalliShort and sPusuShort
+    sPusuShort := false
+    signalPusuShort := false
+
+if sPusu and inTradeRalli
+    sPusu      := false
+    signalPusu := false
+
+if sPusuShort and inTradeRalliShort
+    sPusuShort := false
+    signalPusuShort := false
+
+// =============================================================================
+// BÖLÜM 5: EXECUTION
+// =============================================================================
+
+bool localReportExit = false
+
+bool longSignal = (sRalli or sPusu)
+bool shortSignal = enableShorts and (sRalliShort or sPusuShort)
+bool allowLong = longSignal and not shortSignal
+bool allowShort = shortSignal and not longSignal
+
+// --- PUSU GİRİŞ ---
+if sPusu and not inTradeRalli and allowLong
+    lastSignalBarPusu := bar_index
+    if not inPositionPusu
+        activeSl   := pusuStop
+        pusuInitialStop := pusuStop  // FIX #3
+        tp1Hit     := false
+        inPositionPusu := true
+        trackedT1  := pusuTP1
+        trackedT2  := pusuTP2
+        pusuBars   := 0
+        lastTradeWasRalli := false
+        lastTradeSide := "LONG"
+        logGirisFiyati := pusuLevel
+        logGirisBar    := bar_index
+
+if sPusuShort and not inTradeRalliShort and allowShort
+    lastSignalBarPusuShort := bar_index
+    if not inPositionPusuShort
+        activeSlShort   := pusuStopShort
+        pusuInitialStopShort := pusuStopShort  // FIX #3
+        tp1HitShort     := false
+        inPositionPusuShort := true
+        trackedT1Short  := pusuTP1Short
+        trackedT2Short  := pusuTP2Short
+        pusuBarsShort   := 0
+        lastTradeWasRalli := false
+        lastTradeSide := "SHORT"
+        logGirisFiyati := pusuLevelShort
+        logGirisBar    := bar_index
+
+// --- RALLİ GİRİŞ ---
+if sRalli and allowLong
+    if inPositionPusu
+        inPositionPusu := false
+        activeSl       := na
+        tp1Hit         := false
+        pusuBars       := 0
+    inTradeRalli   := true
+    entryRalli     := close
+    entryRalli_net := entryRalli + (entryRalli * (entrySlippage / 100.0)) + (entryRalli * (entryCommission / 100.0))
+    stopRalli      := entryRalli - riskUnit
+    initialStopRalli := stopRalli  // FIX #6
+    targetRalli    := entryRalli + (riskUnit * FINAL_TARGET_R)
+    peakRalli      := entryRalli
+    logGirisFiyati := entryRalli
+    logGirisBar    := bar_index
+    localReportExit := false
+    lastTradeWasRalli := true
+    lastTradeSide := "LONG"
+
+if sRalliShort and allowShort
+    if inPositionPusuShort
+        inPositionPusuShort := false
+        activeSlShort       := na
+        tp1HitShort         := false
+        pusuBarsShort       := 0
+    inTradeRalliShort   := true
+    entryRalliShort     := close
+    entryRalliShort_net := entryRalliShort - (entryRalliShort * (entrySlippage / 100.0)) - (entryRalliShort * (entryCommission / 100.0))
+    stopRalliShort      := entryRalliShort + riskUnit
+    initialStopRalliShort := stopRalliShort  // FIX #6
+    targetRalliShort    := entryRalliShort - (riskUnit * FINAL_TARGET_R)
+    troughRalliShort    := entryRalliShort
+    logGirisFiyati := entryRalliShort
+    logGirisBar    := bar_index
+    localReportExit := false
+    lastTradeWasRalli := true
+    lastTradeSide := "SHORT"
+
+// =============================================================================
+// TRADE MANAGEMENT — LONG RALLİ (FIX #1 + FIX #5 + FIX #8 + FIX #9)
+// =============================================================================
+
+string trailStatus    = "BAŞLANGIÇ"
+string mentorMsg      = ""
+float  nextTriggerLevel = na
+
+// FIX #5: dataHigh/dataLow tutarlı kullanım
+float logicalStop = ta.lowest(dataLow, 5) - (safeATR * 0.3)
+float atrStop     = entryRalli - riskUnit
+float smartStop   = math.max(logicalStop, atrStop)
+
+// FIX #8: smartStop mesafe sınırı
+float maxSmartStopDistance = entryRalli - (riskUnit * 1.5)
+smartStop := math.max(smartStop, maxSmartStopDistance)
+
+float minSpread = close * 0.005
+if (entryRalli - smartStop) < minSpread
+    smartStop := entryRalli - minSpread
+
+if inTradeRalli
+    // FIX #5: dataHigh kullan
+    peakRalli := math.max(peakRalli, dataHigh)
+
+    float stage1 = entryRalli + riskUnit
+    float stage2 = entryRalli + (riskUnit * 1.5)
+    float stage3 = entryRalli + (riskUnit * 2.5)
+    float stage4 = entryRalli + (riskUnit * 4.0)
+
+    if peakRalli < stage1
+        trailStatus    := "⚠️ RİSKLİ < 1R"
+        nextTriggerLevel := stage1
+        mentorMsg      := "Stop -> GİRİŞ (RİSK 0)"
+        // FIX #1: Stop SADECE yukarı taşınabilir
+        stopRalli      := math.max(stopRalli, smartStop)
+    else if peakRalli < stage2
+        float progress        = math.max(0.0, math.min(1.0, (peakRalli - stage1) / (stage2 - stage1)))
+        float interpolatedStop= stopRalli + (riskUnit * progress * 0.5)
+        // FIX #1: Ratchet
+        stopRalli      := math.max(stopRalli, interpolatedStop)
+        trailStatus    := "1R-1.5R GEÇİŞ ⏳"
+        nextTriggerLevel := stage2
+        mentorMsg      := "Stop -> YÜKSELİYOR"
+    else if peakRalli < stage3
+        // FIX #1: Ratchet
+        stopRalli      := math.max(stopRalli, entryRalli + (riskUnit * 0.5))
+        trailStatus    := "0.5R CEPTE 🔒"
+        nextTriggerLevel := stage3
+        mentorMsg      := "Stop -> 1R KİLİTLE"
+    else if peakRalli < stage4
+        // FIX #1: Ratchet
+        stopRalli      := math.max(stopRalli, entryRalli + riskUnit)
+        trailStatus    := "1R GARANTİ 🏆"
+        nextTriggerLevel := stage4
+        mentorMsg      := "HEDEF (" + str.tostring(FINAL_TARGET_R, "#.1") + "R)"
+    else
+        trailStatus    := "GİRİŞ + " + str.tostring(FINAL_TARGET_R, "#.1") + "R ✅"
+        nextTriggerLevel := na
+        mentorMsg      := "POZİSYONU KAPAT"
+
+    // FIX #5 + FIX #9: dataLow/dataHigh + aynı bar heuristik
+    bool hitStop   = dataLow  <= stopRalli
+    bool hitTarget = dataHigh >= targetRalli
+    if hitStop or hitTarget
+        inTradeRalli   := false
+        localReportExit := true
+
+        if hitStop and hitTarget
+            // FIX #9: Açılış bazlı heuristik
+            if open > (entryRalli + (targetRalli - entryRalli) * 0.5)
+                logCikisFiyati := targetRalli
+                logBitisNedeni := "HEDEF ALINDI 🏆"
+            else
+                logCikisFiyati := stopRalli
+                logBitisNedeni := "STOP OLDU 💀"
+        else if hitTarget
+            logCikisFiyati := targetRalli
+            logBitisNedeni := "HEDEF ALINDI 🏆"
+        else
+            logCikisFiyati := stopRalli
+            logBitisNedeni := "STOP OLDU 💀"
+
+        logCikisFiyati -= (logCikisFiyati * (entrySlippage / 100.0)) + (logCikisFiyati * (entryCommission / 100.0))
+        trailStatus    := str.contains(logBitisNedeni, "HEDEF") ? "GİRİŞ + " + str.tostring(FINAL_TARGET_R, "#.1") + "R ✅" : "STOP 🛑"
+        nextTriggerLevel := na
+
+// =============================================================================
+// TRADE MANAGEMENT — SHORT RALLİ (FIX #2: Simetrik Trail)
+// =============================================================================
+
+string trailStatusShort    = "BAŞLANGIÇ"
+string mentorMsgShort      = ""
+float  nextTriggerLevelShort = na
+
+// FIX: Short smartStop simetrik hesaplama (global scope — ta.* fonksiyonları global olmalı)
+float logicalStopShort = ta.highest(dataHigh, 5) + (safeATR * 0.3)
+float atrStopShort     = entryRalliShort + riskUnit
+float smartStopShort   = math.min(logicalStopShort, atrStopShort)
+float maxSmartStopDistShort = entryRalliShort + (riskUnit * 1.5)
+smartStopShort := math.min(smartStopShort, maxSmartStopDistShort)
+float minSpreadShort = close * 0.005
+if (smartStopShort - entryRalliShort) < minSpreadShort
+    smartStopShort := entryRalliShort + minSpreadShort
+
+if inTradeRalliShort
+    // FIX #5: dataLow kullan
+    troughRalliShort := math.min(troughRalliShort, dataLow)
+
+    float stageS1 = entryRalliShort - riskUnit
+    float stageS2 = entryRalliShort - (riskUnit * 1.5)
+    float stageS3 = entryRalliShort - (riskUnit * 2.5)
+    float stageS4 = entryRalliShort - (riskUnit * 4.0)
+
+    if troughRalliShort > stageS1
+        trailStatusShort      := "⚠️ RİSKLİ < 1R"
+        nextTriggerLevelShort := stageS1
+        mentorMsgShort        := "Stop -> GİRİŞ (RİSK 0)"
+        // FIX #2: Stop SADECE aşağı taşınabilir (short için)
+        stopRalliShort := math.min(stopRalliShort, smartStopShort)
+    else if troughRalliShort > stageS2
+        float progressS = math.max(0.0, math.min(1.0, (stageS1 - troughRalliShort) / (stageS1 - stageS2)))
+        float interpStopS = stopRalliShort - (riskUnit * progressS * 0.5)
+        stopRalliShort        := math.min(stopRalliShort, interpStopS)
+        trailStatusShort      := "1R-1.5R GEÇİŞ ⏳"
+        nextTriggerLevelShort := stageS2
+        mentorMsgShort        := "Stop -> DÜŞÜYOR"
+    else if troughRalliShort > stageS3
+        stopRalliShort        := math.min(stopRalliShort, entryRalliShort - (riskUnit * 0.5))
+        trailStatusShort      := "0.5R CEPTE 🔒"
+        nextTriggerLevelShort := stageS3
+        mentorMsgShort        := "Stop -> 1R KİLİTLE"
+    else if troughRalliShort > stageS4
+        stopRalliShort        := math.min(stopRalliShort, entryRalliShort - riskUnit)
+        trailStatusShort      := "1R GARANTİ 🏆"
+        nextTriggerLevelShort := stageS4
+        mentorMsgShort        := "HEDEF (" + str.tostring(FINAL_TARGET_R, "#.1") + "R)"
+    else
+        trailStatusShort      := "GİRİŞ + " + str.tostring(FINAL_TARGET_R, "#.1") + "R ✅"
+        nextTriggerLevelShort := na
+        mentorMsgShort        := "POZİSYONU KAPAT"
+
+    // FIX #5 + FIX #9: dataHigh/dataLow + aynı bar heuristik (SHORT)
+    bool hitStopS   = dataHigh >= stopRalliShort
+    bool hitTargetS = dataLow  <= targetRalliShort
+    if hitStopS or hitTargetS
+        inTradeRalliShort := false
+        localReportExit := true
+
+        if hitStopS and hitTargetS
+            // FIX #9: Açılış bazlı heuristik (SHORT)
+            if open < (entryRalliShort - (entryRalliShort - targetRalliShort) * 0.5)
+                logCikisFiyati := targetRalliShort
+                logBitisNedeni := "HEDEF ALINDI 🏆"
+            else
+                logCikisFiyati := stopRalliShort
+                logBitisNedeni := "STOP OLDU 💀"
+        else if hitTargetS
+            logCikisFiyati := targetRalliShort
+            logBitisNedeni := "HEDEF ALINDI 🏆"
+        else
+            logCikisFiyati := stopRalliShort
+            logBitisNedeni := "STOP OLDU 💀"
+
+        logCikisFiyati += (logCikisFiyati * (entrySlippage / 100.0)) + (logCikisFiyati * (entryCommission / 100.0))
+        trailStatusShort := str.contains(logBitisNedeni, "HEDEF") ? "GİRİŞ + " + str.tostring(FINAL_TARGET_R, "#.1") + "R ✅" : "STOP 🛑"
+        nextTriggerLevelShort := na
+// =============================================================================
+// PUSU YÖNETİMİ (FIX #10: Tam exit loglama)
+// =============================================================================
+
+if inPositionPusu
+    pusuBars += 1
+    if dataHigh >= trackedT1 and not tp1Hit
+        tp1Hit := true
+    if tp1Hit and useTrailing
+        float newTrailStop = dataClose - (safeATR * trailMult)
+        float prevSl       = na(activeSl) ? 0.0 : activeSl
+        activeSl           := math.max(prevSl, newTrailStop)
+
+    // FIX #10: Ayrıştırılmış çıkış kontrolü
+    bool pusuExitTP2     = dataHigh >= trackedT2
+    bool pusuExitStop    = dataLow  <= activeSl
+    bool pusuExitTimeout = pusuBars > maxPositionBars
+
+    if pusuExitTP2 or pusuExitStop or pusuExitTimeout
+        inPositionPusu  := false
+        localReportExit := true
+
+        if pusuExitTP2
+            logCikisFiyati := trackedT2
+            logBitisNedeni := "HEDEF ALINDI 🏆"
+        else if pusuExitStop
+            logCikisFiyati := nz(activeSl, pusuStop)
+            logBitisNedeni := "STOP OLDU 💀"
+        else
+            logCikisFiyati := close
+            logBitisNedeni := "TIMEOUT ⏰"
+
+        logCikisFiyati -= (logCikisFiyati * (entrySlippage / 100.0)) + (logCikisFiyati * (entryCommission / 100.0))
+        lastTradeWasRalli := false
+        lastTradeSide     := "LONG"
+        activeSl := na
+        tp1Hit   := false
+else
+    pusuBars := 0
+
+// PUSU SHORT YÖNETİMİ (FIX #10)
+if inPositionPusuShort
+    pusuBarsShort += 1
+    if dataLow <= trackedT1Short and not tp1HitShort
+        tp1HitShort := true
+    if tp1HitShort and useTrailing
+        float newTrailStopShort = dataClose + (safeATR * trailMult)
+        float prevSlShort       = na(activeSlShort) ? 999999999.0 : activeSlShort
+        activeSlShort           := math.min(prevSlShort, newTrailStopShort)
+
+    bool pusuShortExitTP2     = dataLow  <= trackedT2Short
+    bool pusuShortExitStop    = dataHigh >= activeSlShort
+    bool pusuShortExitTimeout = pusuBarsShort > maxPositionBars
+
+    if pusuShortExitTP2 or pusuShortExitStop or pusuShortExitTimeout
+        inPositionPusuShort := false
+        localReportExit     := true
+
+        if pusuShortExitTP2
+            logCikisFiyati := trackedT2Short
+            logBitisNedeni := "HEDEF ALINDI 🏆"
+        else if pusuShortExitStop
+            logCikisFiyati := nz(activeSlShort, pusuStopShort)
+            logBitisNedeni := "STOP OLDU 💀"
+        else
+            logCikisFiyati := close
+            logBitisNedeni := "TIMEOUT ⏰"
+
+        logCikisFiyati += (logCikisFiyati * (entrySlippage / 100.0)) + (logCikisFiyati * (entryCommission / 100.0))
+        lastTradeWasRalli := false
+        lastTradeSide     := "SHORT"
+        activeSlShort := na
+        tp1HitShort   := false
+else
+    pusuBarsShort := 0
+
+bool reportExit = localReportExit
+bool tradeBitti = (nz(inTradeRalli[1]) and not inTradeRalli) or (nz(inTradeRalliShort[1]) and not inTradeRalliShort) or reportExit
+
+// =============================================================================
+// BÖLÜM 6: METRICS (FIX #6: initialStop R hesabı)
+// =============================================================================
+
+float currentRiskPercent = FINAL_RISK_BASE
+if volRegime > FINAL_VOL
+    currentRiskPercent := FINAL_RISK_RED
+
+if tradeBitti
+    float tradePnL_Percent = logGirisFiyati != 0.0 ? ((logCikisFiyati - logGirisFiyati) / logGirisFiyati) * 100.0 : 0.0
+    dailyPnL += tradePnL_Percent
+    reportExit := false
+
+    // FIX #6: initialStop ile R hesabı
+    float rrDen_initial = na
+    float rrDen_current = na
+
+    if lastTradeWasRalli
+        if lastTradeSide == "SHORT"
+            rrDen_initial := nz(initialStopRalliShort, stopRalliShort) - logGirisFiyati
+            rrDen_current := stopRalliShort - logGirisFiyati
+        else
+            rrDen_initial := logGirisFiyati - nz(initialStopRalli, stopRalli)
+            rrDen_current := logGirisFiyati - stopRalli
+    else
+        if lastTradeSide == "SHORT"
+            rrDen_initial := nz(pusuInitialStopShort, pusuStopShort) - logGirisFiyati
+            rrDen_current := nz(activeSlShort, pusuStopShort) - logGirisFiyati
+        else
+            rrDen_initial := logGirisFiyati - nz(pusuInitialStop, pusuStop)
+            rrDen_current := logGirisFiyati - nz(activeSl, pusuStop)
+
+    float rr_realized = (rrDen_initial == 0.0 or na(rrDen_initial)) ? 0.0 : math.abs((logCikisFiyati - logGirisFiyati) / rrDen_initial)
+
+    bool tradeWon = (lastTradeSide == "SHORT") ? (logCikisFiyati < logGirisFiyati) : (logCikisFiyati > logGirisFiyati)
+    array.push(tradeWins, tradeWon)
+    array.push(tradeRRs,  rr_realized)
+
+bool dailyLimitBreached = dailyPnL <= -maxDailyLossPercent
+
+// --- KELLY & RİSK GEÇMİŞİ ---
+var float pairWinRate      = 0.35
+var float pairAvgRR        = 1.2
+var int   pairTradeCount   = 0
+var float cumulativeWinRate= 0.5
+var float cumulativeAvgRR  = 1.5
+
+if tradeBitti
+    pairTradeCount += 1
+    if pairTradeCount > 0
+        pairWinRate := (pairWinRate * (pairTradeCount - 1) + (logCikisFiyati > logGirisFiyati ? 1.0 : 0.0)) / pairTradeCount
+
+if array.size(tradeWins) > 0
+    int wins = 0
+    for i = 0 to array.size(tradeWins) - 1
+        if array.get(tradeWins, i)
+            wins += 1
+    float winRate = array.size(tradeWins) > 0 ? wins / array.size(tradeWins) : 0.5
+
+    float sumRR = 0.0
+    for i = 0 to array.size(tradeRRs) - 1
+        sumRR += array.get(tradeRRs, i)
+    float avgRR = array.size(tradeRRs) > 0 ? sumRR / array.size(tradeRRs) : 1.5
+
+    cumulativeWinRate := winRate
+    cumulativeAvgRR   := avgRR
+
+float kellyFraction = 0.0
+if cumulativeAvgRR > 0.0
+    kellyFraction := ((2.0 * cumulativeWinRate) - 1.0) / cumulativeAvgRR
+
+kellyFraction := math.min(0.25, math.max(0.02, kellyFraction))
+float kellySuggestedRiskPercent = kellyFraction * 100.0
+
+var float maxDrawdownTrades       = 0.0
+var float maxConsecutiveLosses    = 0.0
+var int   consecutiveLossesTrades = 0
+
+if tradeBitti
+    float returnThisTrade = logGirisFiyati != 0.0 ? ((logCikisFiyati - logGirisFiyati) / logGirisFiyati) * 100.0 : 0.0
+
+    if returnThisTrade < 0.0
+        float currentDD = math.abs(returnThisTrade)
+        maxDrawdownTrades       := math.max(maxDrawdownTrades, currentDD)
+        consecutiveLossesTrades += 1
+        maxConsecutiveLosses    := math.max(maxConsecutiveLosses, consecutiveLossesTrades)
+    else
+        consecutiveLossesTrades := 0
+
+// =============================================================================
+// BÖLÜM 7: LOGLAMA (FIX #4 + FIX #6: realFill + dual R)
+// =============================================================================
+
+string labelTextLong  = ""
+string labelTextShort = ""
+string labelTextExit  = ""
+
+if tradeBitti
+    float cikisFiyati = logCikisFiyati
+    string tStamp_log = str.format("{0,date,dd.MM HH:mm}", time + 10800000)
+
+    bool isLongSide  = lastTradeSide == "LONG"
+    bool isStopExit  = str.contains(logBitisNedeni, "STOP")
+    bool isTpExit    = str.contains(logBitisNedeni, "HEDEF")
+    bool isTimeoutExit = str.contains(logBitisNedeni, "TIMEOUT")
+    bool isTrailExit = isLongSide and isStopExit and (cikisFiyati > logGirisFiyati)
+
+    string exitReason = "OPTIMUM"
+    if isTpExit
+        exitReason := "HEDEF"
+    else if isTimeoutExit
+        exitReason := "TIMEOUT"
+    else if isStopExit
+        exitReason := isTrailExit ? "İZ SÜREN" : "STOP"
+
+    string exitTitle  = "ÇIKIŞ • " + exitReason + " • " + lastTradeSide
+
+    color exitColor = color.gray
+    if isLongSide
+        if exitReason == "HEDEF"
+            exitColor := color.new(#1565C0, 0)
+        else if exitReason == "STOP"
+            exitColor := color.new(#1e1e46, 7)
+        else if exitReason == "İZ SÜREN"
+            exitColor := color.new(#EF6C00, 0)
+        else if exitReason == "TIMEOUT"
+            exitColor := color.new(#795548, 0)
+        else
+            exitColor := color.new(#455A64, 0)
+    else
+        if exitReason == "HEDEF"
+            exitColor := color.new(#0D47A1, 0)
+        else if exitReason == "STOP"
+            exitColor := color.new(#C62828, 0)
+        else if exitReason == "İZ SÜREN"
+            exitColor := color.new(#E65100, 0)
+        else if exitReason == "TIMEOUT"
+            exitColor := color.new(#795548, 0)
+        else
+            exitColor := color.new(#37474F, 0)
+
+    string pnlLabel = "KÂR/ZARAR"
+    if exitReason == "STOP"
+        pnlLabel := "ZARAR"
+    else if exitReason == "HEDEF" or exitReason == "İZ SÜREN"
+        pnlLabel := "KÂR"
+    else if exitReason == "TIMEOUT"
+        pnlLabel := "SONUÇ"
+
+    float pnlPoints = isLongSide ? (cikisFiyati - logGirisFiyati) : (logGirisFiyati - cikisFiyati)
+    float pnlPercent = logGirisFiyati != 0.0 ? (pnlPoints / logGirisFiyati) * 100.0 : 0.0
+    int   sure = bar_index - logGirisBar
+
+    // FIX #6: Dual R hesabı (initial + current)
+    float rrDen_i = na
+    float rrDen_c = na
+    if lastTradeWasRalli
+        if lastTradeSide == "SHORT"
+            rrDen_i := nz(initialStopRalliShort, stopRalliShort) - logGirisFiyati
+            rrDen_c := stopRalliShort - logGirisFiyati
+        else
+            rrDen_i := logGirisFiyati - nz(initialStopRalli, stopRalli)
+            rrDen_c := logGirisFiyati - stopRalli
+    else
+        if lastTradeSide == "SHORT"
+            rrDen_i := nz(pusuInitialStopShort, pusuStopShort) - logGirisFiyati
+            rrDen_c := nz(activeSlShort, pusuStopShort) - logGirisFiyati
+        else
+            rrDen_i := logGirisFiyati - nz(pusuInitialStop, pusuStop)
+            rrDen_c := logGirisFiyati - nz(activeSl, pusuStop)
+
+    float rr_initial_ui = (rrDen_i == 0.0 or na(rrDen_i)) ? 0.0 : math.abs((logCikisFiyati - logGirisFiyati) / rrDen_i)
+    float rr_current_ui = (rrDen_c == 0.0 or na(rrDen_c)) ? 0.0 : math.abs((logCikisFiyati - logGirisFiyati) / rrDen_c)
+
+    // FIX #4: realFill notu
+    string fillNote = ""
+    if strategy.closedtrades > 0
+        float realFill = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+        fillNote := "\nFILL  : " + str.tostring(realFill, priceFormat)
+
+    string logText =
+         exitTitle + "\n" +
+         "[" + tStamp_log + "]\n" +
+         "GİRİŞ : " + str.tostring(nz(logGirisFiyati), priceFormat) + "\n" +
+         "ÇIKIŞ : " + str.tostring(nz(cikisFiyati), priceFormat) + " (kural)" +
+         fillNote + "\n" +
+         pnlLabel + " : " + str.tostring(nz(pnlPoints), priceFormat) + " / %" + str.tostring(nz(pnlPercent), "#.2") + "\n\n" +
+         "SÜRE  : " + str.tostring(nz(sure)) + "B\n" +
+         "R(ilk): " + str.tostring(nz(rr_initial_ui), "#.2") + " | R(gnl): " + str.tostring(nz(rr_current_ui), "#.2")
+
+    labelTextExit := logText
+
+    bool showExitLabel = (isLongSide and showLongUI) or (not isLongSide and showShortUI)
+    if showExitLabel
+        label.new(bar_index, high, logText, color=exitColor, textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+// =============================================================================
+// BÖLÜM 8: ÇİZİMLER + ETİKETLER (FIX #7: TP1 etiketi)
+// =============================================================================
+
+plot(dailySupport, "Dip Destek", color=color.red, linewidth=2)
+plot(pusuLevel,  "Pusu",        color=color.orange, style=plot.style_circles)
+plot(inPositionPusu ? activeSl  : na, "Pusu Stop (Aktif)", color=color.red,   style=plot.style_linebr, linewidth=2)
+plot(inPositionPusu ? trackedT1 : na, "Pusu TP1",           color=color.green, style=plot.style_linebr)
+plot(inPositionPusu ? trackedT2 : na, "Pusu TP2",           color=color.blue,  style=plot.style_linebr)
+
+plot(inTradeRalli ? stopRalli   : na, "Ralli Stop",  color=color.red,   style=plot.style_linebr, linewidth=2)
+plot(inTradeRalli ? targetRalli : na, "Ralli Hedef", color=color.green, style=plot.style_linebr)
+plot(inTradeRalli ? entryRalli  : na, "Ralli Giriş", color=color.gray,  style=plot.style_linebr)
+
+plot(enableShorts and inTradeRalliShort ? stopRalliShort   : na, "Ralli Stop Short",  color=color.red,   style=plot.style_linebr, linewidth=2)
+plot(enableShorts and inTradeRalliShort ? targetRalliShort : na, "Ralli Hedef Short", color=color.green, style=plot.style_linebr)
+plot(enableShorts and inTradeRalliShort ? entryRalliShort  : na, "Ralli Giriş Short", color=color.gray,  style=plot.style_linebr)
+
+bgcolor(inPositionPusu ? color.new(color.green, 90) : (inTradeRalli ? color.new(color.blue, 90) : na), title="Background Color")
+
+if showLabels and showLongUI
+    if allowLong and signalPusu
+        string tStamp_lbl_p = str.format("{0,date,dd.MM HH:mm}", time + 10800000)
+        string txtP = "GİRİŞ • PUSU • LONG\n[" + tStamp_lbl_p + "]\n" +
+             "GİRİŞ : " + str.tostring(nz(pusuLevel), priceFormat) + "\n" +
+             "STOP  : " + str.tostring(nz(pusuStop), priceFormat) + "\n\n" +
+             "1 STOP TAŞI : " + str.tostring(nz(pusuTP1), priceFormat) + "\n" +
+             "2 KAR AL    : " + str.tostring(nz(pusuTP2), priceFormat) + "\n" +
+             "3 ÇIK!      : " + str.tostring(nz(pusuTP3), priceFormat)
+        labelTextLong := txtP
+        label.new(bar_index, low, txtP, style=label.style_label_up, color=color.new(#2E7D32, 0), textcolor=color.white, size=size.normal)
+
+    if allowLong and signalRalli
+        float L_step1 = entryRalli + riskUnit
+        float L_step2 = entryRalli + (riskUnit * 2.0)
+        float L_final = entryRalli + (riskUnit * FINAL_TARGET_R)
+        string tStamp_lbl = str.format("{0,date,dd.MM HH:mm}", time + 10800000)
+
+        string txt = "GİRİŞ • RALLİ • LONG\n[" + tStamp_lbl + "]\n" +
+             "GİRİŞ : " + str.tostring(nz(entryRalli), priceFormat) + "\n" +
+             "STOP  : " + str.tostring(nz(stopRalli), priceFormat) + "\n\n" +
+             "1 STOP TAŞI : " + str.tostring(nz(L_step1), priceFormat) + "\n" +
+             "2 KAR AL    : " + str.tostring(nz(L_step2), priceFormat) + "\n" +
+             "3 ÇIK!      : " + str.tostring(nz(L_final), priceFormat)
+
+        labelTextLong := txt
+        label.new(bar_index, low, txt, style=label.style_label_up, color=color.new(#1B5E20, 0), textcolor=color.white, size=size.normal)
+
+if showLabels and showShortUI
+    if allowShort and signalPusuShort
+        string tStamp_lbl_s = str.format("{0,date,dd.MM HH:mm}", time + 10800000)
+        string txtPS = "GİRİŞ • PUSU • SHORT\n[" + tStamp_lbl_s + "]\n" +
+             "GİRİŞ : " + str.tostring(nz(pusuLevelShort), priceFormat) + "\n" +
+             "STOP  : " + str.tostring(nz(pusuStopShort), priceFormat) + "\n\n" +
+             "3 ÇIK!      : " + str.tostring(nz(pusuTP3Short), priceFormat) + "\n" +
+             "2 KAR AL    : " + str.tostring(nz(pusuTP2Short), priceFormat) + "\n" +
+             "1 STOP TAŞI : " + str.tostring(nz(pusuTP1Short), priceFormat)
+
+        labelTextShort := txtPS
+        label.new(bar_index, high, txtPS, style=label.style_label_down, color=color.new(#B71C1C, 0), textcolor=color.white, size=size.normal)
+
+    if allowShort and signalRalliShort
+        float S_step1 = entryRalliShort - riskUnit
+        float S_step2 = entryRalliShort - (riskUnit * 2.0)
+        float S_final = entryRalliShort - (riskUnit * FINAL_TARGET_R)
+        string tStamp_lbl_s2 = str.format("{0,date,dd.MM HH:mm}", time + 10800000)
+        string txtS = "GİRİŞ • RALLİ • SHORT\n[" + tStamp_lbl_s2 + "]\n" +
+             "GİRİŞ : " + str.tostring(nz(entryRalliShort), priceFormat) + "\n" +
+             "STOP  : " + str.tostring(nz(stopRalliShort), priceFormat) + "\n\n" +
+             "3 ÇIK!      : " + str.tostring(nz(S_final), priceFormat) + "\n" +
+             "2 KAR AL    : " + str.tostring(nz(S_step2), priceFormat) + "\n" +
+             "1 STOP TAŞI : " + str.tostring(nz(S_step1), priceFormat)
+
+        labelTextShort := txtS
+        label.new(bar_index, low, txtS, style=label.style_label_up, color=color.new(#f2f3f2, 0), textcolor=color.black, size=size.normal)
+
+// DEBUG PANEL
+if debugMode and barstate.islast
+    var label debugLbl = label.new(na, na, "", style=label.style_label_down, color=color.white, textcolor=color.black, size=size.small)
+
+    string s_skor   = confidence >= scoreReq ? "🟢" : "🔴"
+    string s_mesafe = actualDistance <= FINAL_MESAFE ? "🟢" : "🔴"
+    string s_mVeto  = mesafeVeto ? "🔴(Engel)" : "🟢"
+    string s_hVeto  = htfVeto    ? "🔴" : "🟢"
+    string s_vol    = volRegime <= FINAL_VOL*0.85 ? "🟢" : "🔴"
+    string s_rr     = rr1 >= dynamicRrThresh ? "🟢" : "🔴"
+    string s_wait   = (bar_index - lastSignalBarPusu) > dynamicGap ? "🟢" : "🔴"
+
+    bool   r_break      = close > breakLevel
+    float  r_break_dist = breakLevel != 0 ? ((close - breakLevel) / breakLevel) * 100.0 : 0.0
+    string r_break_icon = r_break ? "🟢" : "🔴"
+    string r_dist_icon  = r_break_dist >= 0 ? "🟢" : "🔴"
+    bool   r_vol_ok     = SYSTEM_GREEN_LIGHT
+    bool   r_volm_ok    = volume > ta.sma(volume, 20)
+
+    string dText =
+         "📊 DASHBOARD (V1.6)\n" +
+         "───────────────\n" +
+         "MOD: " + tfName + "\n" +
+         "PİYASA: " + marketName + "\n" +
+         "───────────────\n" +
+         "PUSU | RALLİ\n" +
+         "Skor: %" + str.tostring(confidence, "#.1") + " " + s_skor + " | Break: " + r_break_icon + "\n" +
+         "Mesafe: %" + str.tostring(actualDistance, "#.2") + " " + s_mesafe + " | Brk%: " + str.tostring(r_break_dist, "#.2") + " " + r_dist_icon + "\n" +
+         "HTF: " + s_hVeto + " | Trend: " + (strongTrend ? "🟢" : "🔴") + "\n" +
+         "ADX: " + (adxOk ? "✅" : "❌") + " | ADX: " + (adxOk ? "✅" : "❌") + "\n" +
+         "VOL: " + s_vol + " | VOL: " + (r_vol_ok ? "🟢" : "🔴") + "/VLM:" + (r_volm_ok ? "🟢" : "🔴") + "\n" +
+         "R:R: " + str.tostring(rr1, "#.2") + " " + s_rr + " | TR: " + str.tostring(FINAL_TARGET_R, "#.1") + "\n" +
+         "Bekle: " + s_wait + " | In: " + (inTradeRalli ? "🟢" : "🔴")
+
+    label.set_xy(debugLbl, bar_index, high + (safeATR * 3.0))
+    label.set_text(debugLbl, dText)
+
+// =============================================================================
+// BÖLÜM 9: PANEL (V201.13 — FIX: Sessiz crash düzeltmesi)
+// =============================================================================
+
+var table mainPanel = table.new(mobilMode ? position.bottom_right : position.top_right, 4, 80, bgcolor=color.new(#1e222d, 0), border_width=1, border_color=color.gray)
+
+if barstate.islast and showTable and (showLongUI or showShortUI)
+    table.clear(mainPanel, 0, 0, 3, 79)
+    int r = 0
+    bool showSharedHeader = showLongUI and showShortUI
+
+    // --- SHARED HEADER ---
+    if showSharedHeader
+        color titleBgShared    = dailyLimitBreached ? color.red : color.new(color.blue, 40)
+        string titleTextShared = dailyLimitBreached ? "GÜNLÜK LİMİT AŞILDI! 🛑" : "AKK_STR_V201.13"
+        table.merge_cells(mainPanel, 0, r, 3, r)
+        table.cell(mainPanel, 0, r, titleTextShared, text_color=color.white, bgcolor=titleBgShared, text_size=fSize)
+        r += 1
+
+        color modeColor = (tfName == "🛡️ SNIPER (1H)") ? color.orange : (tfName == "👑 TREND KING (8H+)" ? color.green : color.blue)
+        table.cell(mainPanel, 0, r, "AKTİF MOD", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, tfName, text_color=modeColor, text_size=fSize, bgcolor=color.new(modeColor, 90))
+        r += 1
+
+        color mktBgShared = isCrypto ? color.new(#6a1b9a, 30) : isForex ? color.new(#b71c1c, 30) : color.new(#424242, 30)
+        table.cell(mainPanel, 0, r, "PİYASA", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, marketName, text_color=color.white, text_size=fSize, bgcolor=mktBgShared)
+        r += 1
+
+        table.cell(mainPanel, 0, r, "ANA TREND", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, trendText, text_color=trendColor, text_size=fSize, bgcolor=color.new(trendColor, 85))
+        r += 1
+
+        table.cell(mainPanel, 0, r, "REJİM", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, marketRegimeText, text_color=regimeColor, text_size=fSize)
+        r += 1
+
+    // --- LONG BÖLÜMÜ ---
+    if showLongUI
+        table.merge_cells(mainPanel, 0, r, 3, r)
+        table.cell(mainPanel, 0, r, showShortUI ? "AKK_STR_V201.13 (LONG)" : "AKK_STR_V201.13", text_color=color.white, bgcolor=color.new(color.blue, 40), text_size=fSize)
+        r += 1
+
+        if not showSharedHeader
+            color modeColor2 = (tfName == "🛡️ SNIPER (1H)") ? color.orange : (tfName == "👑 TREND KING (8H+)" ? color.green : color.blue)
+            table.cell(mainPanel, 0, r, "AKTİF MOD", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, tfName, text_color=modeColor2, text_size=fSize, bgcolor=color.new(modeColor2, 90))
+            r += 1
+
+            color mktBg2 = isCrypto ? color.new(#6a1b9a, 30) : isForex ? color.new(#b71c1c, 30) : color.new(#424242, 30)
+            table.cell(mainPanel, 0, r, "PİYASA", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, marketName, text_color=color.white, text_size=fSize, bgcolor=mktBg2)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "ANA TREND", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, trendText, text_color=trendColor, text_size=fSize, bgcolor=color.new(trendColor, 85))
+            r += 1
+
+            table.cell(mainPanel, 0, r, "REJİM", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, marketRegimeText, text_color=regimeColor, text_size=fSize)
+            r += 1
+
+        // PUSU
+        table.merge_cells(mainPanel, 0, r, 3, r)
+        table.cell(mainPanel, 0, r, "🛡️ PUSU (SAVUNMA)", text_color=color.silver, bgcolor=color.new(#363a45, 0), text_size=size.small)
+        r += 1
+
+        string statusPusu = mesafeVeto ? "MESAFE VETO" : htfVeto ? "HTF VETO" : volSpikeVeto ? "WICK VETO" : "AKTİF"
+        color colStatus = (mesafeVeto or htfVeto or volSpikeVeto) ? color.red : color.green
+        table.cell(mainPanel, 0, r, "SKOR / DURUM", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, str.tostring(confidence, "#") + "% (" + statusPusu + ")", text_color=colStatus, text_size=fSize)
+        r += 1
+
+        string tagPusu = strongTrend ? " (GÜÇLÜ)" : " (TEPKİ?)"
+        table.cell(mainPanel, 0, r, "İDEAL GİRİŞ", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, str.tostring(pusuLevel, priceFormat) + tagPusu, text_color=color.orange, text_size=fSize)
+        r += 1
+
+        table.cell(mainPanel, 0, r, "DİP / STOP", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, str.tostring(dailySupport, priceFormat), text_color=color.new(color.red, 30), text_size=fSize)
+        r += 1
+
+        table.cell(mainPanel, 0, r, "R:R (TP1)", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, str.tostring(rr1, "#.##") + " / " + str.tostring(dynamicRrThresh, "#.##"), text_color=rrOk ? color.white : color.red, text_size=fSize)
+        r += 1
+
+        // RALLİ
+        table.merge_cells(mainPanel, 0, r, 3, r)
+        table.cell(mainPanel, 0, r, "⚔️ RALLİ (HÜCUM)", text_color=color.silver, bgcolor=color.new(#363a45, 0), text_size=size.small)
+        r += 1
+
+        if inTradeRalli
+            table.cell(mainPanel, 0, r, "GÜNCEL FİYAT", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, str.tostring(close, priceFormat), text_color=color.white, text_size=fSize)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "DURUM / AŞAMA", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, trailStatus, text_color=color.rgb(255, 215, 0), text_size=fSize, bgcolor=color.new(color.blue, 60))
+            r += 1
+
+            float pnlPct = entryRalli != 0 ? ((close - entryRalli) / entryRalli) * 100.0 : 0.0
+            table.cell(mainPanel, 0, r, "GİRİŞ MALİYETİ", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, str.tostring(entryRalli, priceFormat) + " (%" + str.tostring(pnlPct, "#.1") + ")", text_color=pnlPct > 0 ? color.green : color.red, text_size=fSize)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "MEVCUT STOP", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, str.tostring(stopRalli, priceFormat), text_color=color.red, text_size=fSize)
+            r += 1
+
+            // MENTOR KARTI
+            table.merge_cells(mainPanel, 0, r, 3, r)
+            table.cell(mainPanel, 0, r, "--- 🎓 MENTOR KARTI ---", text_color=color.yellow, bgcolor=color.new(#363a45, 0), text_size=size.small)
+            r += 1
+
+            if not na(nextTriggerLevel)
+                table.cell(mainPanel, 0, r, "SIRADAKİ TETİK", text_color=color.gray, text_size=fSize)
+                table.merge_cells(mainPanel, 1, r, 3, r)
+                table.cell(mainPanel, 1, r, str.tostring(nextTriggerLevel, priceFormat), text_color=color.yellow, text_size=fSize)
+                r += 1
+
+                table.cell(mainPanel, 0, r, "ÖDÜL", text_color=color.gray, text_size=fSize)
+                table.merge_cells(mainPanel, 1, r, 3, r)
+                table.cell(mainPanel, 1, r, mentorMsg, text_color=color.aqua, text_size=fSize)
+                r += 1
+        else
+            table.cell(mainPanel, 0, r, "GÜNCEL FİYAT", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, str.tostring(close, priceFormat), text_color=color.white, text_size=fSize)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "GİRİŞ EŞİĞİ", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, str.tostring(breakLevel, priceFormat) + (useAdaptiveBreak ? " (ADPT)" : ""), text_color=color.aqua, text_size=fSize)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "DURUM", text_color=color.gray, text_size=size.tiny)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, "FIRSAT BEKLENİYOR...", text_color=color.yellow, text_size=size.tiny)
+            r += 1
+
+        // SAFETY & RISK
+        if not mobilMode and (not showSafetyOnce or showLongUI)
+            table.merge_cells(mainPanel, 0, r, 3, r)
+            table.cell(mainPanel, 0, r, "🔌 SAFETY & RISK", text_color=color.silver, bgcolor=color.new(#363a45, 0), text_size=size.small)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "CIRCUIT BREAKER", text_color=color.gray, text_size=fSizeDetail)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, SYSTEM_GREEN_LIGHT ? "🟢 OK" : "🔴 TRIGGERED", text_color=SYSTEM_GREEN_LIGHT ? color.green : color.red, text_size=fSizeDetail)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "RISK PROFILE", text_color=color.gray, text_size=fSizeDetail)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, "Dynamic: %" + str.tostring(currentRiskPercent) + " (Base: " + str.tostring(FINAL_RISK_BASE) + " / Red: " + str.tostring(FINAL_RISK_RED) + " / Cap: " + str.tostring(maxLeverageCap) + "x)", text_color=color.white, text_size=fSizeDetail)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "KELLY STATS", text_color=color.gray, text_size=fSizeDetail)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, "Kelly: %" + str.tostring(kellySuggestedRiskPercent, "#.1") + " | Win: %" + str.tostring(cumulativeWinRate * 100.0, "#.1") + " / AvgR: " + str.tostring(cumulativeAvgRR, "#.2"), text_color=color.white, text_size=fSizeDetail)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "RISK HISTORY", text_color=color.gray, text_size=fSizeDetail)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, "MaxDD: %" + str.tostring(maxDrawdownTrades, "#.1") + " / MaxLoss: " + str.tostring(maxConsecutiveLosses, "#"), text_color=color.white, text_size=fSizeDetail)
+            r += 1
+
+        // MATRIX DETAY (LONG)
+        if showMatrix and not mobilMode
+            table.merge_cells(mainPanel, 0, r, 3, r)
+            table.cell(mainPanel, 0, r, "--- 📊 MATRIX DETAY ---", text_color=color.silver, bgcolor=color.new(#363a45, 0), text_size=size.small)
+            r += 1
+
+            string ok_row = (strongTrend ? "🟩HTF " : "🟥HTF ") + (confidence >= scoreReq ? "🟩SKOR " : "🟥SKOR ") + ((wiz_gate and not mesafeVeto) ? "🟩MOM " : "🟥MOM ") + (rrOk ? "🟩R:R" : "🟥R:R")
+            table.cell(mainPanel, 0, r, "FİLTRELER", text_color=color.gray, text_size=fSizeDetail)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, ok_row, text_color=color.white, text_size=fSizeDetail)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "ADX (KALİTE)", text_color=color.gray, text_size=fSizeDetail)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, "ADX:" + str.tostring(adx, "#.0") + (adxOk ? " ✅" : " ❌"), text_color=adxOk ? color.green : color.red, text_size=fSizeDetail)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "VOLATİLİTE", text_color=color.gray, text_size=fSizeDetail)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, "VOL: " + str.tostring(volRegime, "#.2") + " / Th: " + str.tostring(FINAL_VOL, "#.2"), text_color=volRegime > FINAL_VOL ? color.orange : color.green, text_size=fSizeDetail)
+            r += 1
+
+    // --- SHORT BÖLÜMÜ ---
+    if showShortUI
+        table.merge_cells(mainPanel, 0, r, 3, r)
+        table.cell(mainPanel, 0, r, showLongUI ? "AKK_STR_V201.13 (SHORT)" : "AKK_STR_V201.13", text_color=color.white, bgcolor=color.new(color.blue, 40), text_size=fSize)
+        r += 1
+
+        if not showSharedHeader
+            color modeColorS = (tfName == "🛡️ SNIPER (1H)") ? color.orange : (tfName == "👑 TREND KING (8H+)" ? color.green : color.blue)
+            table.cell(mainPanel, 0, r, "AKTİF MOD", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, tfName, text_color=modeColorS, text_size=fSize, bgcolor=color.new(modeColorS, 90))
+            r += 1
+
+            color mktBgS = isCrypto ? color.new(#6a1b9a, 30) : isForex ? color.new(#b71c1c, 30) : color.new(#424242, 30)
+            table.cell(mainPanel, 0, r, "PİYASA", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, marketName, text_color=color.white, text_size=fSize, bgcolor=mktBgS)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "ANA TREND", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, trendTextShort, text_color=trendColorShort, text_size=fSize, bgcolor=color.new(trendColorShort, 85))
+            r += 1
+
+            table.cell(mainPanel, 0, r, "REJİM", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, marketRegimeText, text_color=regimeColor, text_size=fSize)
+            r += 1
+
+        table.merge_cells(mainPanel, 0, r, 3, r)
+        table.cell(mainPanel, 0, r, "🔻 SHORT (OPSİYONEL)", text_color=color.silver, bgcolor=color.new(#363a45, 0), text_size=size.small)
+        r += 1
+
+        bool shortActive = inTradeRalliShort or inPositionPusuShort
+        string shortStatus = inTradeRalliShort ? "RALLİ SHORT AKTİF" : inPositionPusuShort ? "PUSU SHORT AKTİF" : "PASİF / BEKLEME"
+
+        table.cell(mainPanel, 0, r, "SHORT DURUM", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, shortStatus, text_color=shortActive ? color.red : color.yellow, text_size=fSize)
+        r += 1
+
+        float shortEntry = inTradeRalliShort ? entryRalliShort : inPositionPusuShort ? pusuLevelShort : na
+        float shortStop  = inTradeRalliShort ? stopRalliShort  : inPositionPusuShort ? activeSlShort  : na
+        float shortTP    = inTradeRalliShort ? targetRalliShort : inPositionPusuShort ? trackedT2Short : na
+
+        table.cell(mainPanel, 0, r, "SHORT GİRİŞ", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, shortActive ? str.tostring(nz(shortEntry), priceFormat) : "-", text_color=color.white, text_size=fSize)
+        r += 1
+
+        table.cell(mainPanel, 0, r, "SHORT STOP", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, shortActive ? str.tostring(nz(shortStop), priceFormat) : "-", text_color=color.red, text_size=fSize)
+        r += 1
+
+        table.cell(mainPanel, 0, r, "SHORT HEDEF", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, shortActive ? str.tostring(nz(shortTP), priceFormat) : "-", text_color=color.green, text_size=fSize)
+        r += 1
+
+        table.cell(mainPanel, 0, r, "SHORT R:R", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, str.tostring(rr1Short, "#.##") + " / " + str.tostring(dynamicRrThresh, "#.##"), text_color=rrOkShort ? color.white : color.red, text_size=fSize)
+        r += 1
+
+        table.cell(mainPanel, 0, r, "SHORT SKOR", text_color=color.gray, text_size=fSize)
+        table.merge_cells(mainPanel, 1, r, 3, r)
+        table.cell(mainPanel, 1, r, str.tostring(confidenceShort, "#") + "% / " + str.tostring(scoreReqShort, "#"), text_color=confidenceShort >= scoreReqShort ? color.green : color.red, text_size=fSize)
+        r += 1
+
+        // SHORT MENTOR (Trade aktifken)
+        if inTradeRalliShort
+            table.merge_cells(mainPanel, 0, r, 3, r)
+            table.cell(mainPanel, 0, r, "--- 🎓 SHORT MENTOR ---", text_color=color.yellow, bgcolor=color.new(#363a45, 0), text_size=size.small)
+            r += 1
+
+            table.cell(mainPanel, 0, r, "DURUM / AŞAMA", text_color=color.gray, text_size=fSize)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, trailStatusShort, text_color=color.rgb(255, 215, 0), text_size=fSize, bgcolor=color.new(color.red, 60))
+            r += 1
+
+            if not na(nextTriggerLevelShort)
+                table.cell(mainPanel, 0, r, "SIRADAKİ TETİK", text_color=color.gray, text_size=fSize)
+                table.merge_cells(mainPanel, 1, r, 3, r)
+                table.cell(mainPanel, 1, r, str.tostring(nextTriggerLevelShort, priceFormat), text_color=color.yellow, text_size=fSize)
+                r += 1
+
+                table.cell(mainPanel, 0, r, "ÖDÜL", text_color=color.gray, text_size=fSize)
+                table.merge_cells(mainPanel, 1, r, 3, r)
+                table.cell(mainPanel, 1, r, mentorMsgShort, text_color=color.aqua, text_size=fSize)
+                r += 1
+
+        // SHORT MATRIX
+        if showMatrix and not mobilMode
+            table.merge_cells(mainPanel, 0, r, 3, r)
+            table.cell(mainPanel, 0, r, "--- 🔻 SHORT MINI-MATRIX ---", text_color=color.silver, bgcolor=color.new(#363a45, 0), text_size=size.small)
+            r += 1
+
+            string miniRow = (strongTrendShort ? "🟩HTF" : "🟥HTF") + " | " + (confidenceShort >= scoreReqShort ? "🟩SKOR" : "🟥SKOR") + " | " + (rrOkShort ? "🟩R:R" : "🟥R:R") + " | " + (adxOkShort ? "🟩ADX" : "🟥ADX") + " | " + (volRegime <= FINAL_VOL ? "🟩VOL" : "🟥VOL")
+            table.cell(mainPanel, 0, r, "SATIR", text_color=color.gray, text_size=fSizeDetail)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, miniRow, text_color=color.white, text_size=fSizeDetail)
+            r += 1
+
+        // SHORT SAFETY (ayrı gösterilecekse)
+        if not mobilMode and not showSafetyOnce
+            table.merge_cells(mainPanel, 0, r, 3, r)
+            table.cell(mainPanel, 0, r, "🔌 SAFETY & RISK", text_color=color.silver, bgcolor=color.new(#363a45, 0), text_size=size.small)
+            r += 1
+
+            string circuitStatusS = SYSTEM_GREEN_LIGHT ? "🟢 OK" : "🔴 TRIGGERED"
+            table.cell(mainPanel, 0, r, "CIRCUIT BREAKER", text_color=color.gray, text_size=fSizeDetail)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, circuitStatusS, text_color=SYSTEM_GREEN_LIGHT ? color.green : color.red, text_size=fSizeDetail)
+            r += 1
+
+            string riskProfileTxtS = "Dynamic: %" + str.tostring(currentRiskPercent) + " (Base: " + str.tostring(FINAL_RISK_BASE) + " / Red: " + str.tostring(FINAL_RISK_RED) + " / Cap: " + str.tostring(maxLeverageCap) + "x)"
+            table.cell(mainPanel, 0, r, "RISK PROFILE", text_color=color.gray, text_size=fSizeDetail)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, riskProfileTxtS, text_color=color.white, text_size=fSizeDetail)
+            r += 1
+
+            string kellyTxtS = "Kelly (teorik): %" + str.tostring(kellySuggestedRiskPercent, "#.1") + " | Win: %" + str.tostring(cumulativeWinRate * 100.0, "#.1") + " / AvgR: " + str.tostring(cumulativeAvgRR, "#.2")
+            table.cell(mainPanel, 0, r, "KELLY STATS", text_color=color.gray, text_size=fSizeDetail)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, kellyTxtS, text_color=color.white, text_size=fSizeDetail)
+            r += 1
+
+            string riskHistTxtS = "MaxDD(trade): %" + str.tostring(maxDrawdownTrades, "#.1") + " / MaxLossStreak: " + str.tostring(maxConsecutiveLosses, "#")
+            table.cell(mainPanel, 0, r, "RISK HISTORY", text_color=color.gray, text_size=fSizeDetail)
+            table.merge_cells(mainPanel, 1, r, 3, r)
+            table.cell(mainPanel, 1, r, riskHistTxtS, text_color=color.white, text_size=fSizeDetail)
+            r += 1
+// =============================================================================
+// BÖLÜM 10: STRATEJİ EMRİ + JSON/ALARM (V2 — EXIT DETAIL EKLENDİ)
+// =============================================================================
+
+// ta.* fonksiyonları global scope'ta olmalı
+float val_ema200    = ta.ema(close, 200)
+float avg_vol       = ta.sma(volume, 10)
+
+string passphrase = "AKK_Guvenlik_2026"
+string meta_version = "AKK_STR_V201.13"
+string meta_symbol  = syminfo.ticker
+string meta_mode    = tfName + " | " + marketName
+string tStamp_json  = str.format("{0,date,dd.MM.yyyy HH:mm}", time + 10800000)
+
+string val_trend    = close > val_ema200 ? "BOGA" : "AYI"
+float val_vol_ratio = (avg_vol == 0 or na(avg_vol)) ? 0 : (volume / avg_vol) * 100
+
+string json_technical =
+     "\"technical\":{\"rsi\":" + str.tostring(nz(rsiVal), "#.1") +
+     ",\"adx\":" + str.tostring(nz(adx), "#.1") +
+     ",\"dist_sma200\":" + str.tostring(nz(((close - val_ema200)/val_ema200)*100), "#.2") +
+     ",\"vol_regime\":" + str.tostring(nz(volRegime), "#.2") +
+     ",\"vol_ratio\":" + str.tostring(nz(val_vol_ratio), "#.0") +
+     ",\"trend\":\"" + val_trend + "\"}"
+
+string json_meta =
+     "\"meta\":{\"version\":\"" + meta_version +
+     "\",\"symbol\":\"" + meta_symbol +
+     "\",\"mode\":\"" + meta_mode +
+     "\",\"timestamp\":\"" + tStamp_json + "\"}"
+
+float long_tp1  = entryRalli + (riskUnit * 2.0)
+float short_tp1 = entryRalliShort - (riskUnit * 2.0)
+
+string json_trade_long =
+     "\"trade\":{\"price\":" + str.tostring(nz(sRalli ? entryRalli : pusuLevel), "#.####") +
+     ",\"stop\":" + str.tostring(nz(sRalli ? stopRalli : pusuStop), "#.####") +
+     ",\"tp1\":" + str.tostring(nz(sRalli ? long_tp1 : pusuTP1), "#.####") +
+     ",\"tp2\":" + str.tostring(nz(sRalli ? targetRalli : pusuTP2), "#.####") + "}"
+
+string json_trade_short =
+     "\"trade\":{\"price\":" + str.tostring(nz(sRalliShort ? entryRalliShort : pusuLevelShort), "#.####") +
+     ",\"stop\":" + str.tostring(nz(sRalliShort ? stopRalliShort : pusuStopShort), "#.####") +
+     ",\"tp1\":" + str.tostring(nz(sRalliShort ? short_tp1 : pusuTP1Short), "#.####") +
+     ",\"tp2\":" + str.tostring(nz(sRalliShort ? targetRalliShort : pusuTP2Short), "#.####") + "}"
+
+string json_analysis =
+     "\"analysis\":{\"score\":" + str.tostring(nz(confidence / 10.0), "#.2") + "}"
+
+string labelTextLongJson  = str.replace_all(str.replace_all(labelTextLong, "\"", "\\\""), "\n", "\\n")
+string labelTextShortJson = str.replace_all(str.replace_all(labelTextShort, "\"", "\\\""), "\n", "\\n")
+string labelTextExitJson  = str.replace_all(str.replace_all(labelTextExit, "\"", "\\\""), "\n", "\\n")
+
+// ─── EXIT DETAIL BLOĞU (YENİ) ─────────────────────────────────────────────
+
+string exitEngineType = lastTradeWasRalli ? "RALLI" : "PUSU"
+
+string exitTypeLabel = "MANUAL"
+if str.contains(logBitisNedeni, "HEDEF")
+    exitTypeLabel := "TP2"
+else if str.contains(logBitisNedeni, "TIMEOUT")
+    exitTypeLabel := "TIMEOUT"
+else if str.contains(logBitisNedeni, "STOP")
+    if lastTradeSide == "LONG" and logCikisFiyati > logGirisFiyati
+        exitTypeLabel := "TRAIL"
+    else if lastTradeSide == "SHORT" and logCikisFiyati < logGirisFiyati
+        exitTypeLabel := "TRAIL"
+    else
+        exitTypeLabel := "STOP"
+
+float exitPnlPercent = logGirisFiyati != 0.0 ? ((logCikisFiyati - logGirisFiyati) / logGirisFiyati) * 100.0 : 0.0
+if lastTradeSide == "SHORT"
+    exitPnlPercent := logGirisFiyati != 0.0 ? ((logGirisFiyati - logCikisFiyati) / logGirisFiyati) * 100.0 : 0.0
+
+int exitDurationBars = bar_index - logGirisBar
+
+float exit_rrDen_i = na
+float exit_rrDen_c = na
+if lastTradeWasRalli
+    if lastTradeSide == "SHORT"
+        exit_rrDen_i := nz(initialStopRalliShort, stopRalliShort) - logGirisFiyati
+        exit_rrDen_c := stopRalliShort - logGirisFiyati
+    else
+        exit_rrDen_i := logGirisFiyati - nz(initialStopRalli, stopRalli)
+        exit_rrDen_c := logGirisFiyati - stopRalli
+else
+    if lastTradeSide == "SHORT"
+        exit_rrDen_i := nz(pusuInitialStopShort, pusuStopShort) - logGirisFiyati
+        exit_rrDen_c := nz(activeSlShort, pusuStopShort) - logGirisFiyati
+    else
+        exit_rrDen_i := logGirisFiyati - nz(pusuInitialStop, pusuStop)
+        exit_rrDen_c := logGirisFiyati - nz(activeSl, pusuStop)
+
+float exit_r_initial = (exit_rrDen_i == 0.0 or na(exit_rrDen_i)) ? 0.0 : math.abs((logCikisFiyati - logGirisFiyati) / exit_rrDen_i)
+float exit_r_current = (exit_rrDen_c == 0.0 or na(exit_rrDen_c)) ? 0.0 : math.abs((logCikisFiyati - logGirisFiyati) / exit_rrDen_c)
+
+float peakR_val = 0.0
+if lastTradeWasRalli
+    if lastTradeSide == "LONG" and exit_rrDen_i != 0.0 and not na(exit_rrDen_i)
+        peakR_val := math.abs((peakRalli - logGirisFiyati) / exit_rrDen_i)
+    else if lastTradeSide == "SHORT" and exit_rrDen_i != 0.0 and not na(exit_rrDen_i)
+        peakR_val := math.abs((logGirisFiyati - troughRalliShort) / exit_rrDen_i)
+
+string exitTrailStage = lastTradeSide == "LONG" ? trailStatus : trailStatusShort
+
+int totalTrades = array.size(tradeWins)
+int totalWins = 0
+if totalTrades > 0
+    for i = 0 to totalTrades - 1
+        if array.get(tradeWins, i)
+            totalWins += 1
+float cumWinRate = totalTrades > 0 ? (totalWins * 1.0 / totalTrades) * 100.0 : 0.0
+
+string json_exit_detail =
+     "\"exit_detail\":{" +
+     "\"entry_price\":" + str.tostring(nz(logGirisFiyati), "#.####") +
+     ",\"exit_price\":" + str.tostring(nz(logCikisFiyati), "#.####") +
+     ",\"exit_type\":\"" + exitTypeLabel + "\"" +
+     ",\"side\":\"" + lastTradeSide + "\"" +
+     ",\"engine\":\"" + exitEngineType + "\"" +
+     ",\"pnl_percent\":" + str.tostring(nz(exitPnlPercent), "#.##") +
+     ",\"r_initial\":" + str.tostring(nz(exit_r_initial), "#.##") +
+     ",\"r_current\":" + str.tostring(nz(exit_r_current), "#.##") +
+     ",\"peak_r\":" + str.tostring(nz(peakR_val), "#.##") +
+     ",\"duration_bars\":" + str.tostring(nz(exitDurationBars)) +
+     ",\"trail_stage\":\"" + exitTrailStage + "\"" +
+     ",\"cumulative\":{\"total\":" + str.tostring(totalTrades) +
+     ",\"wins\":" + str.tostring(totalWins) +
+     ",\"win_rate\":" + str.tostring(nz(cumWinRate), "#.#") +
+     ",\"avg_r\":" + str.tostring(nz(cumulativeAvgRR), "#.##") +
+     ",\"kelly\":" + str.tostring(nz(kellySuggestedRiskPercent), "#.#") +
+     ",\"max_dd\":" + str.tostring(nz(maxDrawdownTrades), "#.#") + "}}"
+
+// ─── GİRİŞ JSON'LARI ──────────────────────────────────────────────────────
+
+string json_entry_long =
+     "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol +
+     "\",\"action\":\"buy\",\"side\":\"LONG\",\"event\":\"ENTRY\",\"comment\":\"{{strategy.order.comment}}\",\"close\":" +
+     str.tostring(close) + "," + json_technical + "," + json_meta + "," + json_trade_long + "," + json_analysis +
+     ",\"label_text\":\"" + labelTextLongJson + "\"}"
+
+string json_entry_short =
+     "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol +
+     "\",\"action\":\"sell\",\"side\":\"SHORT\",\"event\":\"ENTRY\",\"comment\":\"{{strategy.order.comment}}\",\"close\":" +
+     str.tostring(close) + "," + json_technical + "," + json_meta + "," + json_trade_short + "," + json_analysis +
+     ",\"label_text\":\"" + labelTextShortJson + "\"}"
+
+// ─── ÇIKIŞ JSON'LARI (exit_detail EKLENDİ) ────────────────────────────────
+
+string json_exit_stop_long =
+     "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol +
+     "\",\"action\":\"sell\",\"side\":\"LONG\",\"event\":\"EXIT\",\"reason\":\"STOP\",\"comment\":\"{{strategy.order.comment}}\",\"close\":" +
+     str.tostring(close) + "," + json_exit_detail + ",\"meta\":{\"mode\":\"" + meta_mode + "\"},\"label_text\":\"" + labelTextExitJson + "\"}"
+
+string json_exit_tp2_long =
+     "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol +
+     "\",\"action\":\"sell\",\"side\":\"LONG\",\"event\":\"EXIT\",\"reason\":\"TP2\",\"comment\":\"{{strategy.order.comment}}\",\"close\":" +
+     str.tostring(close) + "," + json_exit_detail + ",\"meta\":{\"mode\":\"" + meta_mode + "\"},\"label_text\":\"" + labelTextExitJson + "\"}"
+
+string json_exit_manual_long =
+     "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol +
+     "\",\"action\":\"sell\",\"side\":\"LONG\",\"event\":\"EXIT\",\"reason\":\"MANUAL\",\"comment\":\"{{strategy.order.comment}}\",\"close\":" +
+     str.tostring(close) + "," + json_exit_detail + ",\"meta\":{\"mode\":\"" + meta_mode + "\"},\"label_text\":\"" + labelTextExitJson + "\"}"
+
+string json_exit_timeout_long =
+     "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol +
+     "\",\"action\":\"sell\",\"side\":\"LONG\",\"event\":\"EXIT\",\"reason\":\"TIMEOUT\",\"comment\":\"{{strategy.order.comment}}\",\"close\":" +
+     str.tostring(close) + "," + json_exit_detail + ",\"meta\":{\"mode\":\"" + meta_mode + "\"},\"label_text\":\"" + labelTextExitJson + "\"}"
+
+string json_exit_stop_short =
+     "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol +
+     "\",\"action\":\"buy\",\"side\":\"SHORT\",\"event\":\"EXIT\",\"reason\":\"STOP\",\"comment\":\"{{strategy.order.comment}}\",\"close\":" +
+     str.tostring(close) + "," + json_exit_detail + ",\"meta\":{\"mode\":\"" + meta_mode + "\"},\"label_text\":\"" + labelTextExitJson + "\"}"
+
+string json_exit_tp2_short =
+     "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol +
+     "\",\"action\":\"buy\",\"side\":\"SHORT\",\"event\":\"EXIT\",\"reason\":\"TP2\",\"comment\":\"{{strategy.order.comment}}\",\"close\":" +
+     str.tostring(close) + "," + json_exit_detail + ",\"meta\":{\"mode\":\"" + meta_mode + "\"},\"label_text\":\"" + labelTextExitJson + "\"}"
+
+string json_exit_manual_short =
+     "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol +
+     "\",\"action\":\"buy\",\"side\":\"SHORT\",\"event\":\"EXIT\",\"reason\":\"MANUAL\",\"comment\":\"{{strategy.order.comment}}\",\"close\":" +
+     str.tostring(close) + "," + json_exit_detail + ",\"meta\":{\"mode\":\"" + meta_mode + "\"},\"label_text\":\"" + labelTextExitJson + "\"}"
+
+string json_exit_timeout_short =
+     "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol +
+     "\",\"action\":\"buy\",\"side\":\"SHORT\",\"event\":\"EXIT\",\"reason\":\"TIMEOUT\",\"comment\":\"{{strategy.order.comment}}\",\"close\":" +
+     str.tostring(close) + "," + json_exit_detail + ",\"meta\":{\"mode\":\"" + meta_mode + "\"},\"label_text\":\"" + labelTextExitJson + "\"}"
+// =============================================================================
+// STRATEJİ EMRİ (Entry/Exit)
+// =============================================================================
+
+float plannedStopLong = sRalli ? (close - riskUnit) : (sPusu ? pusuStop : na)
+float plannedStopShort = sRalliShort ? (close + riskUnit) : (sPusuShort ? pusuStopShort : na)
+
+float riskDollarLong = strategy.equity * (currentRiskPercent / 100.0)
+float riskDollarShort = strategy.equity * (shortRiskPercent / 100.0)
+
+float distanceToStopLong = na(plannedStopLong) ? na : math.abs(close - plannedStopLong)
+float targetQtyLong = (not na(distanceToStopLong) and distanceToStopLong > 0.0) ? (riskDollarLong / distanceToStopLong) : 0.0
+
+float distanceToStopShort = na(plannedStopShort) ? na : math.abs(close - plannedStopShort)
+float targetQtyShort = (not na(distanceToStopShort) and distanceToStopShort > 0.0) ? (riskDollarShort / distanceToStopShort) : 0.0
+
+float maxAllowedQty = (strategy.equity * maxLeverageCap) / close
+float finalQtyLong = math.min(targetQtyLong, maxAllowedQty)
+float finalQtyShort = math.min(targetQtyShort, maxAllowedQty)
+
+bool blockAlert = dailyLimitBreached and (allowLong or allowShort)
+
+bool canEnterLong = allowLong and not blockAlert and barstate.isconfirmed and strategy.position_size == 0
+bool canEnterShort = allowShort and not blockAlert and barstate.isconfirmed and strategy.position_size == 0
+
+// --- ETİKET BAZLI ALARM ---
+bool labelLongSignal  = showLabels and showLongUI and allowLong and (signalRalli or signalPusu) and barstate.isconfirmed
+bool labelShortSignal = showLabels and showShortUI and allowShort and (signalRalliShort or signalPusuShort) and barstate.isconfirmed
+
+bool labelLongFire  = labelLongSignal  and not labelLongSignal[1]
+bool labelShortFire = labelShortSignal and not labelShortSignal[1]
+
+bool exitFire      = tradeBitti and not tradeBitti[1] and barstate.isconfirmed
+bool exitLongFire  = exitFire and lastTradeSide == "LONG"
+bool exitShortFire = exitFire and lastTradeSide == "SHORT"
+
+bool exitIsStop    = str.contains(logBitisNedeni, "STOP")
+bool exitIsTp2     = str.contains(logBitisNedeni, "HEDEF")
+bool exitIsTimeout = str.contains(logBitisNedeni, "TIMEOUT")
+bool exitIsManual  = not exitIsStop and not exitIsTp2 and not exitIsTimeout
+
+if labelLongFire
+    alert(json_entry_long, alert.freq_once_per_bar_close)
+
+if labelShortFire
+    alert(json_entry_short, alert.freq_once_per_bar_close)
+
+if exitLongFire
+    string exitJson = exitIsStop ? json_exit_stop_long : exitIsTp2 ? json_exit_tp2_long : exitIsTimeout ? json_exit_timeout_long : json_exit_manual_long
+    alert(exitJson, alert.freq_once_per_bar_close)
+
+if exitShortFire
+    string exitJsonS = exitIsStop ? json_exit_stop_short : exitIsTp2 ? json_exit_tp2_short : exitIsTimeout ? json_exit_timeout_short : json_exit_manual_short
+    alert(exitJsonS, alert.freq_once_per_bar_close)
+
+if canEnterLong
+    strategy.entry("Long", strategy.long, qty=finalQtyLong, comment="AL", alert_message=json_entry_long)
+
+if canEnterShort
+    strategy.entry("Short", strategy.short, qty=finalQtyShort, comment="SAT", alert_message=json_entry_short)
+
+// Long exits (Ayrı exit ID'leri: TP ve STOP farklı webhook JSON gönderir — Pine v5 geçerli pattern)
+if strategy.position_size > 0
+    if inPositionPusu
+        strategy.exit("Exit Pusu TP2", "Long", limit=trackedT2, comment_profit="PUSU_TP", alert_message=json_exit_tp2_long)
+        strategy.exit("Exit Pusu STOP", "Long", stop=activeSl, comment_loss="PUSU_STOP", alert_message=json_exit_stop_long)
+    else if inTradeRalli
+        strategy.exit("Exit Ralli TP2", "Long", limit=targetRalli, comment_profit="RALLI_TP", alert_message=json_exit_tp2_long)
+        strategy.exit("Exit Ralli STOP", "Long", stop=stopRalli, comment_loss="RALLI_STOP", alert_message=json_exit_stop_long)
+
+// Short exits (Ayrı exit ID'leri: TP ve STOP farklı webhook JSON gönderir)
+if strategy.position_size < 0
+    if inPositionPusuShort
+        strategy.exit("Exit Pusu Short TP2", "Short", limit=trackedT2Short, comment_profit="PUSU_TP", alert_message=json_exit_tp2_short)
+        strategy.exit("Exit Pusu Short STOP", "Short", stop=activeSlShort, comment_loss="PUSU_STOP", alert_message=json_exit_stop_short)
+    else if inTradeRalliShort
+        strategy.exit("Exit Ralli Short TP2", "Short", limit=targetRalliShort, comment_profit="RALLI_TP", alert_message=json_exit_tp2_short)
+        strategy.exit("Exit Ralli Short STOP", "Short", stop=stopRalliShort, comment_loss="RALLI_STOP", alert_message=json_exit_stop_short)
+
+// --- ALARM TEST MODU ---
+if alarmTestModu and barstate.isconfirmed
+    string testJson = "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol + "\",\"action\":\"test\",\"event\":\"TEST\",\"comment\":\"ALARM_TEST\",\"close\":" + str.tostring(close) + ",\"meta\":{\"mode\":\"" + meta_mode + "\"}}"
+    alert(testJson, alert.freq_once_per_bar_close)
+
+// --- TP1 INFO ALERT + ETİKET (FIX #7) ---
+var bool tp1AlertedLong  = false
+var bool tp1AlertedShort = false
+
+if canEnterLong or canEnterShort
+    tp1AlertedLong  := false
+    tp1AlertedShort := false
+
+bool tp1LongHit = (strategy.position_size > 0) and not tp1AlertedLong and dataHigh >= (sRalli ? long_tp1 : pusuTP1)
+bool tp1ShortHit = (strategy.position_size < 0) and not tp1AlertedShort and dataLow <= (sRalliShort ? short_tp1 : pusuTP1Short)
+
+string json_tp1_long =
+     "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol +
+     "\",\"action\":\"info\",\"side\":\"LONG\",\"event\":\"TP1\",\"reason\":\"TP1\",\"comment\":\"TP1_INFO\",\"close\":" + str.tostring(close) +
+     ",\"meta\":{\"mode\":\"" + meta_mode + "\"}}"
+
+string json_tp1_short =
+     "{\"passphrase\":\"" + passphrase + "\",\"ticker\":\"" + meta_symbol +
+     "\",\"action\":\"info\",\"side\":\"SHORT\",\"event\":\"TP1\",\"reason\":\"TP1\",\"comment\":\"TP1_INFO\",\"close\":" + str.tostring(close) +
+     ",\"meta\":{\"mode\":\"" + meta_mode + "\"}}"
+
+if tp1LongHit
+    tp1AlertedLong := true
+    alert(json_tp1_long)
+    // FIX #7: TP1 etiketi
+    if showLabels and showLongUI
+        string tp1Txt = "TP1 🎯\n" + str.tostring(close, priceFormat)
+        label.new(bar_index, dataHigh, tp1Txt, style=label.style_label_down, color=color.new(#FFD600, 0), textcolor=color.black, size=size.small)
+
+if tp1ShortHit
+    tp1AlertedShort := true
+    alert(json_tp1_short)
+    // FIX #7: TP1 etiketi (SHORT)
+    if showLabels and showShortUI
+        string tp1TxtS = "TP1 🎯\n" + str.tostring(close, priceFormat)
+        label.new(bar_index, dataLow, tp1TxtS, style=label.style_label_up, color=color.new(#FFD600, 0), textcolor=color.black, size=size.small)
+
+// --- LİVE PANEL ---
+var label livePanel = label.new(bar_index, close, "", style=label.style_label_left, color=color.new(color.blue, 15), textcolor=color.white, size=size.small)
+
+if barstate.islast and showLivePanel
+    string riskStatus = (currentRiskPercent == FINAL_RISK_RED) ? "DEFANSIF (VOLATIL)" : "STANDART"
+    string p_txt = "V1.6_UNIVERSAL\nMod: " + riskStatus + "\nRisk: %" + str.tostring(currentRiskPercent, "#.2") + "\nADX: " + str.tostring(adx, "#.1")
+
+    label.set_xy(livePanel, bar_index + 4, close)
+    label.set_text(livePanel, p_txt)
+// === AKK_WATCH_V201.13_CDX_FULL — SON ===

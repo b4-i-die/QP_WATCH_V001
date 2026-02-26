@@ -1,0 +1,71 @@
+# Arduino IDE
+*.hex
+*.eep
+*.elf
+
+# Build directories
+build/
+*.build/
+
+# Arduino Library Manager
+libraries/
+
+# PlatformIO
+.pio/
+.vscode/
+.clang_complete
+.gcc-flags.json
+
+# MacOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory
+
+# Editor backups
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+*.code-workspace
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.cache
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+
+# Documentation build
+docs/_build/
+docs/.doctrees/
+
+# System files
+.Spotlight-V100
+.Trashes
+ehthumbs.db
